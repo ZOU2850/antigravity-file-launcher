@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>File Launcher</title>
-  <link rel="stylesheet" href="/styles.css?v=1.6" />
+  <link rel="stylesheet" href="/styles.css?v=1.7" />
   <style>
 /*
  * File Launcher — Codex Minimalist UI with Native Antigravity Light/Dark Theme Sync
@@ -507,6 +507,9 @@ html, body {
   right: 0;
   top: calc(100% + 4px);
   min-width: 185px;
+  max-height: 175px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: var(--bg-surface);
   border: 1px solid var(--border-strong);
   border-radius: 6px;
@@ -702,6 +705,9 @@ html, body {
           </button>
         </div>
         <div class="header-right">
+          <button id="sortTimeBtn" class="icon-btn active" title="点击切换时间排序方向（最新优先 / 最早优先）">
+            <span id="sortTimeLabel">按时间: 最新↓</span>
+          </button>
           <button id="groupToggleBtn" class="icon-btn active" title="按文件类型分组显示">
             <span>按类型分组</span>
           </button>
@@ -756,6 +762,6 @@ html, body {
     <div id="toastMsg" class="toast-msg hidden"></div>
   </div>
 
-  <script src="/app.js?v=1.6"></script>
+  <script src="/app.js?v=1.7"></script>
 </body>
 </html>

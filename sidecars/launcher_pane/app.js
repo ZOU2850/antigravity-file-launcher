@@ -58,6 +58,8 @@
     tab: "session",
     category: "all",
     groupByType: true,
+    // sortBy: "default" | "time_desc" (最新优先) | "time_asc" (最早优先)
+    sortBy: "time_desc",
     search: "",
     sessionFiles: [],
     sentFiles: [],
@@ -149,7 +151,7 @@
     ) {
       try {
         window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri: f.fileUri });
-        showToast("已在 Antigravity 内打开");
+        showToast("已在右侧分栏打开 " + f.name);
         return;
       } catch (e) {
         console.warn("toggleAuxPane fallback:", e);
@@ -212,6 +214,22 @@
     renderAll();
   }
 
+  function updateSortButtonUI() {
+    const btn = el("sortTimeBtn");
+    const label = el("sortTimeLabel");
+    if (!btn || !label) return;
+    if (state.sortBy === "time_desc") {
+      btn.classList.add("active");
+      label.textContent = "按时间: 最新↓";
+    } else if (state.sortBy === "time_asc") {
+      btn.classList.add("active");
+      label.textContent = "按时间: 最早↑";
+    } else {
+      btn.classList.remove("active");
+      label.textContent = "按时间排序";
+    }
+  }
+
   el("docBackBtn").addEventListener("click", closeInternalDocView);
   el("docMenuBtn").addEventListener("click", (e) => {
     e.stopPropagation();
@@ -229,6 +247,18 @@
   el("tabSent").addEventListener("click", () => switchTab("sent"));
   el("tabRecent").addEventListener("click", () => switchTab("recent"));
 
+  el("sortTimeBtn").addEventListener("click", () => {
+    if (state.sortBy === "time_desc") {
+      state.sortBy = "time_asc";
+      showToast("已切换为：按时间从早到晚排序");
+    } else {
+      state.sortBy = "time_desc";
+      showToast("已切换为：按时间从新到旧排序");
+    }
+    updateSortButtonUI();
+    renderList();
+  });
+
   el("groupToggleBtn").addEventListener("click", () => {
     state.groupByType = !state.groupByType;
     el("groupToggleBtn").classList.toggle("active", state.groupByType);
@@ -245,14 +275,20 @@
     showToast("已刷新");
   });
 
-  // Strictly isolated data source per tab:
-  // - "sent" ONLY returns user-sent files (state.sentFiles)
-  // - "session" ONLY returns AI deliverables in current session
-  // - "recent" ONLY returns project files
   function getBaseFiles() {
     if (state.tab === "sent") return state.sentFiles || [];
     if (state.tab === "recent") return state.recentFiles || [];
     return state.sessionFiles || [];
+  }
+
+  function applySort(files) {
+    const list = [...files];
+    if (state.sortBy === "time_desc") {
+      list.sort((a, b) => (b.mtimeMs || 0) - (a.mtimeMs || 0));
+    } else if (state.sortBy === "time_asc") {
+      list.sort((a, b) => (a.mtimeMs || 0) - (b.mtimeMs || 0));
+    }
+    return list;
   }
 
   function renderCategoryBar(baseFiles) {
@@ -280,7 +316,6 @@
       strip.appendChild(btn);
     });
 
-    // Also provide an isolated quick-entry pill in the category bar when not in "sent" tab
     if (state.tab !== "sent") {
       const div = document.createElement("span");
       div.className = "cat-divider";
@@ -311,8 +346,8 @@
     const isSent = Boolean(f.isUserSent) || state.tab === "sent";
     const subParts = [];
     if (isSent && f.sentScopeLabel) subParts.push(f.sentScopeLabel);
-    if (sizeTxt) subParts.push(sizeTxt);
     if (timeTxt) subParts.push(timeTxt);
+    if (sizeTxt) subParts.push(sizeTxt);
     if (!isSent && f.dir) subParts.push(f.dir);
 
     item.innerHTML = `
@@ -384,17 +419,19 @@
     const container = el("fileListContainer");
     const baseFiles = getBaseFiles();
 
-    const filtered = baseFiles.filter((f) => {
-      if (state.search) {
-        const hay = ((f.name || "") + " " + (f.path || "") + " " + (f.categoryLabel || "")).toLowerCase();
-        if (!hay.includes(state.search)) return false;
-      } else if (state.category === "all") {
-        if (state.tab !== "sent" && !f.isReadable) return false;
-      } else {
-        if ((f.category || "other") !== state.category) return false;
-      }
-      return true;
-    });
+    const filtered = applySort(
+      baseFiles.filter((f) => {
+        if (state.search) {
+          const hay = ((f.name || "") + " " + (f.path || "") + " " + (f.categoryLabel || "")).toLowerCase();
+          if (!hay.includes(state.search)) return false;
+        } else if (state.category === "all") {
+          if (state.tab !== "sent" && !f.isReadable) return false;
+        } else {
+          if ((f.category || "other") !== state.category) return false;
+        }
+        return true;
+      })
+    );
 
     const readableSessionCount = (state.sessionFiles || []).filter((f) => f.isReadable).length;
     const sentCount = (state.sentFiles || []).length;
@@ -458,6 +495,7 @@
   }
 
   function renderAll() {
+    updateSortButtonUI();
     renderCategoryBar(getBaseFiles());
     renderList();
   }
@@ -487,6 +525,16 @@
     }
   }
 
+  async function pollPendingOpen() {
+    try {
+      const res = await sidecarFetch("/api/poll-open");
+      const data = await res.json();
+      if (data && data.ok && data.pendingInternalOpen && data.pendingInternalOpen.file) {
+        openInsideAntigravity(data.pendingInternalOpen.file);
+      }
+    } catch (e) {}
+  }
+
   if (window.sidecar && typeof window.sidecar.onWorkspaceChange === "function") {
     window.sidecar.onWorkspaceChange(() => {
       fetchState(false);
@@ -494,7 +542,8 @@
   }
 
   fetchState(false);
+  setInterval(pollPendingOpen, 500);
   setInterval(() => {
     if (!state.openMenuPath) fetchState(false);
-  }, 1500);
+  }, 2500);
 })();

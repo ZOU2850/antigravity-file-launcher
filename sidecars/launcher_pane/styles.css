@@ -499,6 +499,9 @@ html, body {
   right: 0;
   top: calc(100% + 4px);
   min-width: 185px;
+  max-height: 175px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: var(--bg-surface);
   border: 1px solid var(--border-strong);
   border-radius: 6px;

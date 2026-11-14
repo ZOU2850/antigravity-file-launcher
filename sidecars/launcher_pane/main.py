@@ -102,6 +102,31 @@ def find_app_data_dirs():
     return found
 
 
+def get_ipc_path():
+    dirs = find_app_data_dirs()
+    base = dirs[0] if dirs else (Path.home() / ".gemini" / "antigravity")
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "file_launcher_ipc.json"
+
+
+def read_ipc_state():
+    p = get_ipc_path()
+    if not p.exists():
+        return {"lastSidecarSeen": 0.0, "pendingInternalOpen": None}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"lastSidecarSeen": 0.0, "pendingInternalOpen": None}
+
+
+def write_ipc_state(state_obj):
+    p = get_ipc_path()
+    try:
+        p.write_text(json.dumps(state_obj, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def get_config_path():
     dirs = find_app_data_dirs()
     base = dirs[0] if dirs else (Path.home() / ".gemini" / "antigravity")
@@ -1175,10 +1200,17 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             for flist in (session_files, sent_files, recent_files, pinned_files):
                 for item in flist:
                     item["matchedApps"] = get_matched_apps_for_ext(item.get("ext", ""), apps)
+            ipc = read_ipc_state()
             pending_doc = None
-            if query.get("client") == "sidecar" and PENDING_INTERNAL_OPEN:
-                pending_doc = PENDING_INTERNAL_OPEN
-                PENDING_INTERNAL_OPEN = None
+            if query.get("client") == "sidecar":
+                ipc["lastSidecarSeen"] = time.time()
+                if ipc.get("pendingInternalOpen"):
+                    # Only consume if fresh (within last 60 seconds)
+                    p_item = ipc["pendingInternalOpen"]
+                    if time.time() - float(p_item.get("ts") or 0) < 60.0:
+                        pending_doc = p_item
+                    ipc["pendingInternalOpen"] = None
+                write_ipc_state(ipc)
             self._send_json(200, {
                 "ok": True,
                 "conversationId": conv_id,
@@ -1200,13 +1232,28 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": False, "error": "文件不存在"})
                 return
             info["matchedApps"] = get_matched_apps_for_ext(info.get("ext", ""), detect_installed_apps())
-            PENDING_INTERNAL_OPEN = {"file": info, "ts": time.time()}
-            sidecar_active = (time.time() - LAST_SIDECAR_SEEN) < 8.0
+            ipc = read_ipc_state()
+            ipc["pendingInternalOpen"] = {"file": info, "ts": time.time()}
+            write_ipc_state(ipc)
+            sidecar_active = (time.time() - float(ipc.get("lastSidecarSeen") or 0)) < 10.0
             self._send_json(200, {
                 "ok": True,
                 "sidecarActive": sidecar_active,
                 "file": info,
             })
+            return
+
+        if route == "/api/poll-open":
+            ipc = read_ipc_state()
+            ipc["lastSidecarSeen"] = time.time()
+            pending_doc = None
+            if ipc.get("pendingInternalOpen"):
+                p_item = ipc["pendingInternalOpen"]
+                if time.time() - float(p_item.get("ts") or 0) < 60.0:
+                    pending_doc = p_item
+                ipc["pendingInternalOpen"] = None
+            write_ipc_state(ipc)
+            self._send_json(200, {"ok": True, "pendingInternalOpen": pending_doc})
             return
 
         if route == "/api/preview":
