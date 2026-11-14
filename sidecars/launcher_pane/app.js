@@ -54,15 +54,18 @@
   };
 
   let state = {
-    // tab: "session" (AI产出) | "sent" (单独隔离：我发送的文件) | "recent" (最近项目)
+    // tab: "session" (本次产出) | "sent" (我发送的文件) | "pinned" (★收藏防压缩) | "archived" (已归档) | "recent" (最近项目)
     tab: "session",
     category: "all",
     groupByType: true,
-    // sortBy: "default" | "time_desc" (最新优先) | "time_asc" (最早优先)
     sortBy: "time_desc",
+    selectMode: false,
+    selectedPaths: new Set(),
     search: "",
     sessionFiles: [],
     sentFiles: [],
+    pinnedFiles: [],
+    archivedFiles: [],
     recentFiles: [],
     openMenuPath: null,
     collapsedGroups: new Set(),
@@ -84,7 +87,7 @@
     t.textContent = msg;
     t.classList.remove("hidden");
     clearTimeout(showToast._t);
-    showToast._t = setTimeout(() => t.classList.add("hidden"), 2000);
+    showToast._t = setTimeout(() => t.classList.add("hidden"), 2400);
   }
 
   function getConversationId() {
@@ -138,21 +141,62 @@
     }
   }
 
-  async function openInsideAntigravity(f) {
+  async function executeBatchAction(op, paths) {
+    if (!paths || !paths.length) {
+      showToast("请先勾选至少一个文件");
+      return;
+    }
+    try {
+      const q = new URLSearchParams({
+        op,
+        paths: JSON.stringify(paths),
+        conversationId: getConversationId(),
+      });
+      const res = await sidecarFetch("/api/batch?" + q.toString());
+      const data = await res.json();
+      if (!data.ok) {
+        showToast("操作失败: " + (data.error || "未知错误"));
+        return;
+      }
+      if (op === "pin") {
+        showToast(`★ 已收藏 ${paths.length} 个文件（已开启防上下文压缩保护）`);
+      } else if (op === "unpin") {
+        showToast("已取消收藏");
+      } else if (op === "archive") {
+        showToast(`📦 已归档 ${paths.length} 个文件至 D:\\projects\\Archived_Docs`);
+      } else if (op === "unarchive") {
+        showToast("已移出归档列表");
+      } else if (op === "copy_chat_refs") {
+        try {
+          if (navigator.clipboard && data.chatText) {
+            await navigator.clipboard.writeText(data.chatText);
+          }
+        } catch (e) {}
+        showToast(`💬 已复制 ${paths.length} 个文件的 @引用 到剪贴板，直接在输入框 Ctrl+V 即可发送`);
+      }
+      await fetchState(true);
+    } catch (err) {
+      showToast("请求失败: " + err.message);
+    }
+  }
+
+  async function openInsideAntigravity(f, fromPoll) {
     if (!f || !f.path) return;
     const ext = (f.ext || "").toLowerCase();
 
+    const targetUri = f.openUri || (NATIVE_FILEVIEW_EXTS.has(ext) ? f.fileUri : "");
     if (
-      NATIVE_FILEVIEW_EXTS.has(ext) &&
+      targetUri &&
       window.sidecar &&
       window.sidecar.ui &&
-      typeof window.sidecar.ui.toggleAuxPane === "function" &&
-      f.fileUri
+      typeof window.sidecar.ui.toggleAuxPane === "function"
     ) {
       try {
-        window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri: f.fileUri });
+        window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri: targetUri });
         showToast("已在右侧分栏打开 " + f.name);
-        return;
+        if (NATIVE_FILEVIEW_EXTS.has(ext) || fromPoll) {
+          return;
+        }
       } catch (e) {
         console.warn("toggleAuxPane fallback:", e);
       }
@@ -210,6 +254,7 @@
     state.category = "all";
     el("tabSession").classList.toggle("active", nextTab === "session");
     el("tabSent").classList.toggle("active", nextTab === "sent");
+    el("tabPinned").classList.toggle("active", nextTab === "pinned");
     el("tabRecent").classList.toggle("active", nextTab === "recent");
     renderAll();
   }
@@ -220,14 +265,28 @@
     if (!btn || !label) return;
     if (state.sortBy === "time_desc") {
       btn.classList.add("active");
-      label.textContent = "按时间: 最新↓";
+      label.textContent = "时间↓";
     } else if (state.sortBy === "time_asc") {
       btn.classList.add("active");
-      label.textContent = "按时间: 最早↑";
+      label.textContent = "时间↑";
     } else {
       btn.classList.remove("active");
-      label.textContent = "按时间排序";
+      label.textContent = "时间";
     }
+  }
+
+  function updateCompositeBarUI() {
+    const bar = el("compositeBar");
+    const selectBtn = el("selectModeBtn");
+    selectBtn.classList.toggle("active", state.selectMode);
+    selectBtn.querySelector("span").textContent = state.selectMode ? "退出选择" : "选择";
+
+    if (!state.selectMode) {
+      bar.classList.add("hidden");
+      return;
+    }
+    bar.classList.remove("hidden");
+    el("selCountLabel").textContent = `已选 ${state.selectedPaths.size} 项`;
   }
 
   el("docBackBtn").addEventListener("click", closeInternalDocView);
@@ -245,7 +304,41 @@
 
   el("tabSession").addEventListener("click", () => switchTab("session"));
   el("tabSent").addEventListener("click", () => switchTab("sent"));
+  el("tabPinned").addEventListener("click", () => switchTab("pinned"));
   el("tabRecent").addEventListener("click", () => switchTab("recent"));
+
+  el("selectModeBtn").addEventListener("click", () => {
+    state.selectMode = !state.selectMode;
+    if (!state.selectMode) {
+      state.selectedPaths.clear();
+    }
+    updateCompositeBarUI();
+    renderList();
+  });
+
+  el("selAllBtn").addEventListener("click", () => {
+    const visible = getFilteredFiles();
+    const allSelected = visible.length > 0 && visible.every((f) => state.selectedPaths.has(f.path));
+    if (allSelected) {
+      state.selectedPaths.clear();
+    } else {
+      visible.forEach((f) => state.selectedPaths.add(f.path));
+    }
+    updateCompositeBarUI();
+    renderList();
+  });
+
+  el("batchPinBtn").addEventListener("click", () => {
+    executeBatchAction("pin", Array.from(state.selectedPaths));
+  });
+
+  el("batchArchiveBtn").addEventListener("click", () => {
+    executeBatchAction("archive", Array.from(state.selectedPaths));
+  });
+
+  el("batchChatBtn").addEventListener("click", () => {
+    executeBatchAction("copy_chat_refs", Array.from(state.selectedPaths));
+  });
 
   el("sortTimeBtn").addEventListener("click", () => {
     if (state.sortBy === "time_desc") {
@@ -277,18 +370,42 @@
 
   function getBaseFiles() {
     if (state.tab === "sent") return state.sentFiles || [];
+    if (state.tab === "pinned") return state.pinnedFiles || [];
+    if (state.tab === "archived") return state.archivedFiles || [];
     if (state.tab === "recent") return state.recentFiles || [];
     return state.sessionFiles || [];
   }
 
   function applySort(files) {
     const list = [...files];
-    if (state.sortBy === "time_desc") {
-      list.sort((a, b) => (b.mtimeMs || 0) - (a.mtimeMs || 0));
-    } else if (state.sortBy === "time_asc") {
-      list.sort((a, b) => (a.mtimeMs || 0) - (b.mtimeMs || 0));
-    }
+    list.sort((a, b) => {
+      // Starred/Pinned files always stay protected at top in session view
+      if (state.tab === "session" && Boolean(a.isPinned) !== Boolean(b.isPinned)) {
+        return a.isPinned ? -1 : 1;
+      }
+      if (state.sortBy === "time_asc") {
+        return (a.mtimeMs || 0) - (b.mtimeMs || 0);
+      }
+      return (b.mtimeMs || 0) - (a.mtimeMs || 0);
+    });
     return list;
+  }
+
+  function getFilteredFiles() {
+    const baseFiles = getBaseFiles();
+    return applySort(
+      baseFiles.filter((f) => {
+        if (state.search) {
+          const hay = ((f.name || "") + " " + (f.path || "") + " " + (f.categoryLabel || "")).toLowerCase();
+          if (!hay.includes(state.search)) return false;
+        } else if (state.category === "all") {
+          if (state.tab !== "sent" && state.tab !== "pinned" && state.tab !== "archived" && !f.isReadable) return false;
+        } else {
+          if ((f.category || "other") !== state.category) return false;
+        }
+        return true;
+      })
+    );
   }
 
   function renderCategoryBar(baseFiles) {
@@ -297,10 +414,13 @@
     baseFiles.forEach((f) => {
       const cat = f.category || "other";
       counts[cat] = (counts[cat] || 0) + 1;
-      if (state.tab === "sent" || f.isReadable) counts.all += 1;
+      if (state.tab === "sent" || state.tab === "pinned" || state.tab === "archived" || f.isReadable) counts.all += 1;
     });
 
-    const allLabel = state.tab === "sent" ? "全部我发送的" : "全部文档";
+    const allLabel =
+      state.tab === "sent" ? "全部我发送的" :
+      state.tab === "pinned" ? "全部收藏(防压缩)" :
+      state.tab === "archived" ? "全部已归档" : "全部文档";
     const pills = ["all", ...CATEGORY_ORDER.filter((c) => (counts[c] || 0) > 0)];
     strip.innerHTML = "";
 
@@ -316,23 +436,22 @@
       strip.appendChild(btn);
     });
 
-    if (state.tab !== "sent") {
-      const div = document.createElement("span");
-      div.className = "cat-divider";
-      strip.appendChild(div);
+    // Quick entry pills for Archived & Sent when in other tabs
+    const div = document.createElement("span");
+    div.className = "cat-divider";
+    strip.appendChild(div);
 
-      const sentBtn = document.createElement("button");
-      sentBtn.className = "cat-pill sent-isolated";
-      sentBtn.title = "单独查看我发送给 Antigravity 的文件（与产出文档完全隔离）";
-      sentBtn.innerHTML = `<span>我发送的文件</span><span class="cat-num">${(state.sentFiles || []).length}</span>`;
-      sentBtn.addEventListener("click", () => switchTab("sent"));
-      strip.appendChild(sentBtn);
-    }
+    const archBtn = document.createElement("button");
+    archBtn.className = "cat-pill" + (state.tab === "archived" ? " active" : "");
+    archBtn.innerHTML = `<span>📦 已归档</span><span class="cat-num">${(state.archivedFiles || []).length}</span>`;
+    archBtn.addEventListener("click", () => switchTab("archived"));
+    strip.appendChild(archBtn);
   }
 
   function createItemElement(f) {
     const item = document.createElement("div");
-    item.className = "codex-item";
+    const isSelected = state.selectedPaths.has(f.path);
+    item.className = "codex-item" + (isSelected ? " selected" : "");
     const extLabel = f.isDir ? "DIR" : (f.ext || "FILE").replace(".", "").toUpperCase();
     const matched = Array.isArray(f.matchedApps) ? f.matchedApps : [];
     const sizeTxt = formatSize(f.size);
@@ -350,11 +469,20 @@
     if (sizeTxt) subParts.push(sizeTxt);
     if (!isSent && f.dir) subParts.push(f.dir);
 
+    const checkHtml = state.selectMode
+      ? `<span class="sel-check ${isSelected ? "checked" : ""}" data-act="toggle-select">${isSelected ? "✓" : ""}</span>`
+      : `<button class="star-btn ${f.isPinned ? "pinned" : ""}" data-act="toggle-pin" title="${f.isPinned ? "已收藏（防上下文压缩保护中），点击取消" : "收藏此文件（防止上下文压缩丢失）"}">${f.isPinned ? "★" : "☆"}</button>`;
+
+    const badgesHtml =
+      (f.isPinned ? `<span class="pin-badge" title="防上下文压缩保护中">★防压缩</span>` : "") +
+      (f.isArchived ? `<span class="arch-badge">已归档</span>` : "");
+
     item.innerHTML = `
-      <div class="item-main" data-act="default-open" title="点击直接用默认程序打开">
+      <div class="item-main" data-act="main-click" title="${state.selectMode ? "点击勾选/取消勾选" : "点击直接用默认程序打开"}">
+        ${checkHtml}
         <span class="ext-pill ${esc(f.category || "other")}">${esc(extLabel)}</span>
         <div class="item-text">
-          <div class="item-name">${esc(f.name)}</div>
+          <div class="item-name">${esc(f.name)}${badgesHtml}</div>
           <div class="item-sub">${esc(subParts.join(" · "))}</div>
         </div>
       </div>
@@ -366,7 +494,18 @@
         <div class="dropdown-menu ${isMenuOpen ? "" : "hidden"}">
           <button class="menu-item" data-mode="antigravity_internal">
             <span>Antigravity 内部打开</span>
-            <span class="menu-tag">内置</span>
+            <span class="menu-tag">侧边栏</span>
+          </button>
+          <div class="menu-divider"></div>
+          <div class="menu-section-label">文件管理与上下文</div>
+          <button class="menu-item" data-mode="pin_toggle">
+            <span>${f.isPinned ? "★ 取消收藏保留" : "★ 收藏保留 (防压缩)"}</span>
+          </button>
+          <button class="menu-item" data-mode="copy_chat">
+            <span>💬 加入对话框 (@引用)</span>
+          </button>
+          <button class="menu-item" data-mode="archive_toggle">
+            <span>${f.isArchived ? "📦 移出归档" : "📦 归档保存"}</span>
           </button>
           <div class="menu-divider"></div>
           ${matched.length ? `<div class="menu-section-label">匹配的应用</div>${appButtonsHtml}<div class="menu-divider"></div>` : ""}
@@ -380,8 +519,23 @@
       </div>
     `;
 
-    item.querySelector('[data-act="default-open"]').addEventListener("click", () => {
-      triggerExternalOpen(f.path, "default", "");
+    const pinBtn = item.querySelector('[data-act="toggle-pin"]');
+    if (pinBtn) {
+      pinBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        executeBatchAction(f.isPinned ? "unpin" : "pin", [f.path]);
+      });
+    }
+
+    item.querySelector('[data-act="main-click"]').addEventListener("click", () => {
+      if (state.selectMode) {
+        if (state.selectedPaths.has(f.path)) state.selectedPaths.delete(f.path);
+        else state.selectedPaths.add(f.path);
+        updateCompositeBarUI();
+        renderList();
+      } else {
+        triggerExternalOpen(f.path, "default", "");
+      }
     });
 
     const menuEl = item.querySelector(".dropdown-menu");
@@ -405,7 +559,13 @@
         const mode = btn.getAttribute("data-mode");
         const appId = btn.getAttribute("data-app") || "";
         if (mode === "antigravity_internal") {
-          openInsideAntigravity(f);
+          openInsideAntigravity(f, false);
+        } else if (mode === "pin_toggle") {
+          executeBatchAction(f.isPinned ? "unpin" : "pin", [f.path]);
+        } else if (mode === "copy_chat") {
+          executeBatchAction("copy_chat_refs", [f.path]);
+        } else if (mode === "archive_toggle") {
+          executeBatchAction(f.isArchived ? "unarchive" : "archive", [f.path]);
         } else {
           triggerExternalOpen(f.path, mode, appId);
         }
@@ -417,32 +577,24 @@
 
   function renderList() {
     const container = el("fileListContainer");
-    const baseFiles = getBaseFiles();
-
-    const filtered = applySort(
-      baseFiles.filter((f) => {
-        if (state.search) {
-          const hay = ((f.name || "") + " " + (f.path || "") + " " + (f.categoryLabel || "")).toLowerCase();
-          if (!hay.includes(state.search)) return false;
-        } else if (state.category === "all") {
-          if (state.tab !== "sent" && !f.isReadable) return false;
-        } else {
-          if ((f.category || "other") !== state.category) return false;
-        }
-        return true;
-      })
-    );
+    const filtered = getFilteredFiles();
 
     const readableSessionCount = (state.sessionFiles || []).filter((f) => f.isReadable).length;
     const sentCount = (state.sentFiles || []).length;
+    const pinnedCount = (state.pinnedFiles || []).length;
     const readableRecentCount = (state.recentFiles || []).filter((f) => f.isReadable).length;
     el("countSession").textContent = String(readableSessionCount || (state.sessionFiles || []).length);
     el("countSent").textContent = String(sentCount);
+    el("countPinned").textContent = String(pinnedCount);
     el("countRecent").textContent = String(readableRecentCount || (state.recentFiles || []).length);
 
     if (!filtered.length) {
       if (state.tab === "sent") {
         container.innerHTML = `<div class="empty-box">暂无您发送的文件（您在聊天中发送或上传的图片、文档会单独隔离保存在此分类）</div>`;
+      } else if (state.tab === "pinned") {
+        container.innerHTML = `<div class="empty-box">暂无收藏保留的文件（点击文件左侧 ☆ 或通过「选择 -> 收藏」可将重要文件永久保留，防止上下文压缩丢失）</div>`;
+      } else if (state.tab === "archived") {
+        container.innerHTML = `<div class="empty-box">暂无已归档的文件（可通过「选择 -> 归档」将成品文档归档保存）</div>`;
       } else {
         container.innerHTML = `<div class="empty-box">该分类下暂无文件</div>`;
       }
@@ -496,6 +648,7 @@
 
   function renderAll() {
     updateSortButtonUI();
+    updateCompositeBarUI();
     renderCategoryBar(getBaseFiles());
     renderList();
   }
@@ -509,6 +662,8 @@
 
       state.sessionFiles = data.sessionFiles || [];
       state.sentFiles = data.sentFiles || [];
+      state.pinnedFiles = data.pinnedFiles || [];
+      state.archivedFiles = data.archivedFiles || [];
       state.recentFiles = data.recentFiles || [];
 
       if (!manual && state.sessionFiles.length === 0 && state.recentFiles.length > 0 && state.tab === "session") {
@@ -516,7 +671,7 @@
       }
 
       if (data.pendingInternalOpen && data.pendingInternalOpen.file) {
-        openInsideAntigravity(data.pendingInternalOpen.file);
+        openInsideAntigravity(data.pendingInternalOpen.file, true);
       }
 
       renderAll();
@@ -530,7 +685,7 @@
       const res = await sidecarFetch("/api/poll-open");
       const data = await res.json();
       if (data && data.ok && data.pendingInternalOpen && data.pendingInternalOpen.file) {
-        openInsideAntigravity(data.pendingInternalOpen.file);
+        openInsideAntigravity(data.pendingInternalOpen.file, true);
       }
     } catch (e) {}
   }
@@ -544,6 +699,6 @@
   fetchState(false);
   setInterval(pollPendingOpen, 500);
   setInterval(() => {
-    if (!state.openMenuPath) fetchState(false);
+    if (!state.openMenuPath && !state.selectMode) fetchState(false);
   }, 2500);
 })();

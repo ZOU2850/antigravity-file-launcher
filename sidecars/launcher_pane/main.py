@@ -139,9 +139,140 @@ def default_config():
     return {
         "watchedDirs": [default_dir],
         "pinnedFiles": [],
+        "archivedFiles": [],
         "customApps": [],
         "extDefaults": {},
     }
+
+
+import shutil as _shutil
+
+
+def sync_anti_compaction_manifest(pinned_paths, active_conv_id=""):
+    """
+    Persist a human- and AI-readable manifest of pinned (anti-compaction protected) files
+    both in D:\\projects\\Pinned_Protected_Files and in the active conversation brain directory,
+    so context compaction NEVER loses track of starred files.
+    """
+    prot_dir = Path("D:\\projects\\Pinned_Protected_Files") if IS_WIN else (Path.home() / "Pinned_Protected_Files")
+    prot_dir.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "# ★ 防压缩保护文件清单 (Pinned Anti-Compaction Files)",
+        "",
+        "> 以下文件已被用户标记为「收藏保留（防压缩）」。即使对话发生上下文压缩（Context Compaction），也必须始终保留并优先参考这些文件：",
+        "",
+    ]
+    valid_count = 0
+    for raw_p in pinned_paths or []:
+        norm = os.path.normpath(raw_p)
+        if not os.path.exists(norm):
+            continue
+        valid_count += 1
+        name = os.path.basename(norm)
+        # If the file lives in a temporary/hidden upload folder, also keep a safe backup copy in prot_dir
+        backup_note = ""
+        if ".user_uploaded" in norm.lower() or "\\scratch\\" in norm.lower():
+            try:
+                dst = prot_dir / name
+                if os.path.abspath(norm).lower() != os.path.abspath(str(dst)).lower():
+                    _shutil.copy2(norm, dst)
+                backup_note = f" (已备份至 `{dst}`)"
+            except Exception:
+                pass
+        lines.append(f"- **{name}**: `{norm}`{backup_note}")
+
+    if valid_count == 0:
+        lines.append("- （当前暂无收藏保护文件）")
+
+    manifest_text = "\n".join(lines) + "\n"
+    try:
+        (prot_dir / "PINNED_FILES_MANIFEST.md").write_text(manifest_text, encoding="utf-8")
+    except Exception:
+        pass
+
+    if active_conv_id and ID_RE.match(active_conv_id):
+        for ad in find_app_data_dirs():
+            conv_dir = Path(ad) / "brain" / active_conv_id
+            if conv_dir.exists():
+                try:
+                    (conv_dir / "PINNED_FILES_MANIFEST.md").write_text(manifest_text, encoding="utf-8")
+                except Exception:
+                    pass
+
+
+def perform_batch_action(op, paths, conv_id=""):
+    """
+    Execute composite actions on one or more files:
+    - pin: Star & protect files from context compaction
+    - unpin: Remove from starred list
+    - archive: Copy/archive files into D:\\projects\\Archived_Docs and record in archivedFiles
+    - unarchive: Remove from archived list
+    - copy_chat_refs: Copy @path references to Windows clipboard for instant pasting into chat
+    """
+    cfg = load_user_config()
+    pins = list(cfg.get("pinnedFiles") or [])
+    archived = list(cfg.get("archivedFiles") or [])
+    norm_paths = [os.path.normpath(p.strip()) for p in (paths or []) if p and isinstance(p, str) and p.strip()]
+    norm_paths = [p for p in norm_paths if os.path.exists(p)]
+
+    if not norm_paths and op not in ("unpin", "unarchive"):
+        return {"ok": False, "error": "未找到有效的文件路径"}
+
+    if op == "pin":
+        for p in norm_paths:
+            if not any(x.lower() == p.lower() for x in pins):
+                pins.insert(0, p)
+        cfg["pinnedFiles"] = pins
+        save_user_config(cfg)
+        sync_anti_compaction_manifest(pins, conv_id)
+        return {"ok": True, "op": op, "count": len(norm_paths), "pinnedFiles": pins}
+
+    if op == "unpin":
+        raw_Checks = {os.path.normpath(p.strip()).lower() for p in (paths or []) if p}
+        pins = [x for x in pins if x.lower() not in raw_Checks]
+        cfg["pinnedFiles"] = pins
+        save_user_config(cfg)
+        sync_anti_compaction_manifest(pins, conv_id)
+        return {"ok": True, "op": op, "pinnedFiles": pins}
+
+    if op == "archive":
+        arch_dir = Path("D:\\projects\\Archived_Docs") if IS_WIN else (Path.home() / "Archived_Docs")
+        arch_dir.mkdir(parents=True, exist_ok=True)
+        archived_out = []
+        for p in norm_paths:
+            dst = arch_dir / os.path.basename(p)
+            try:
+                if os.path.isfile(p) and os.path.abspath(p).lower() != os.path.abspath(str(dst)).lower():
+                    _shutil.copy2(p, dst)
+            except Exception:
+                pass
+            if not any(x.lower() == p.lower() for x in archived):
+                archived.insert(0, p)
+            archived_out.append(str(dst))
+        cfg["archivedFiles"] = archived
+        save_user_config(cfg)
+        return {"ok": True, "op": op, "count": len(norm_paths), "archiveDir": str(arch_dir), "archivedFiles": archived}
+
+    if op == "unarchive":
+        raw_checks = {os.path.normpath(p.strip()).lower() for p in (paths or []) if p}
+        archived = [x for x in archived if x.lower() not in raw_checks]
+        cfg["archivedFiles"] = archived
+        save_user_config(cfg)
+        return {"ok": True, "op": op, "archivedFiles": archived}
+
+    if op == "copy_chat_refs":
+        refs = [f"@{p}" for p in norm_paths]
+        clip_text = " ".join(refs) + " "
+        if IS_WIN:
+            try:
+                p_clip = subprocess.Popen(["clip.exe"], stdin=subprocess.PIPE)
+                p_clip.communicate(input=clip_text.encode("utf-16-le"))
+            except Exception:
+                pass
+        return {"ok": True, "op": op, "count": len(norm_paths), "chatText": clip_text, "refs": refs}
+
+    return {"ok": False, "error": f"未知操作: {op}"}
 
 
 def load_user_config():
@@ -155,6 +286,8 @@ def load_user_config():
             cfg["watchedDirs"] = raw["watchedDirs"]
         if isinstance(raw.get("pinnedFiles"), list):
             cfg["pinnedFiles"] = raw["pinnedFiles"]
+        if isinstance(raw.get("archivedFiles"), list):
+            cfg["archivedFiles"] = raw["archivedFiles"]
         if isinstance(raw.get("customApps"), list):
             cfg["customApps"] = raw["customApps"]
         if isinstance(raw.get("extDefaults"), dict):
@@ -1020,6 +1153,174 @@ def preview_markdown_to_html(text):
     return "\n".join(out) or "<p>文档内容为空。</p>"
 
 
+def docx_to_markdown(real_path):
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    lines = []
+    with zipfile.ZipFile(real_path, "r") as zf:
+        if "word/document.xml" not in zf.namelist():
+            return "# 无法读取 Word 文档内容"
+        xml_bytes = zf.read("word/document.xml")
+    root = ET.fromstring(xml_bytes)
+    body = root.find("w:body", ns)
+    if body is None:
+        return "# 文档内容为空"
+
+    for child in body:
+        tag = child.tag.split("}")[-1]
+        if tag == "p":
+            texts = []
+            is_bold = False
+            max_sz = 0
+            pPr = child.find("w:pPr", ns)
+            style_val = ""
+            if pPr is not None:
+                pStyle = pPr.find("w:pStyle", ns)
+                if pStyle is not None:
+                    style_val = pStyle.attrib.get(f"{{{ns['w']}}}val", "")
+            for r in child.findall(".//w:r", ns):
+                rPr = r.find("w:rPr", ns)
+                if rPr is not None:
+                    if rPr.find("w:b", ns) is not None:
+                        is_bold = True
+                    sz_el = rPr.find("w:sz", ns)
+                    if sz_el is not None:
+                        try:
+                            sz_v = int(sz_el.attrib.get(f"{{{ns['w']}}}val", "0"))
+                            if sz_v > max_sz:
+                                max_sz = sz_v
+                        except Exception:
+                            pass
+                for t in r.findall(".//w:t", ns):
+                    if t.text:
+                        texts.append(t.text)
+            line = "".join(texts).strip()
+            if not line:
+                continue
+            if "Heading1" in style_val or "Title" in style_val or max_sz >= 32:
+                lines.append(f"# {line}\n")
+            elif "Heading2" in style_val or max_sz >= 26:
+                lines.append(f"## {line}\n")
+            elif is_bold:
+                lines.append(f"**{line}**\n")
+            else:
+                lines.append(f"{line}\n")
+        elif tag == "tbl":
+            rows = []
+            for tr in child.findall(".//w:tr", ns):
+                cells = []
+                for tc in tr.findall("./w:tc", ns):
+                    cell_texts = [t.text for t in tc.findall(".//w:t", ns) if t.text]
+                    cells.append(" ".join("".join(cell_texts).split()).replace("|", "\\|"))
+                if cells:
+                    rows.append(cells)
+            if rows:
+                col_cnt = max(len(r) for r in rows)
+                norm_rows = [r + [""] * (col_cnt - len(r)) for r in rows]
+                lines.append("| " + " | ".join(norm_rows[0]) + " |")
+                lines.append("| " + " | ".join(["---"] * col_cnt) + " |")
+                for r in norm_rows[1:]:
+                    lines.append("| " + " | ".join(r) + " |")
+                lines.append("")
+    return "\n".join(lines).strip() or "# 该 Word 文档暂无文字内容"
+
+
+def pptx_to_markdown(real_path):
+    lines = []
+    with zipfile.ZipFile(real_path, "r") as zf:
+        slide_names = sorted(
+            [n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml")],
+            key=lambda x: int(re.sub(r"\D", "", x) or "0")
+        )
+        for idx, sname in enumerate(slide_names, 1):
+            root = ET.fromstring(zf.read(sname))
+            lines.append(f"## 第 {idx} 页幻灯片\n")
+            for p in root.iter():
+                if p.tag.endswith("}p"):
+                    runs = [t.text for t in p.iter() if t.tag.endswith("}t") and t.text]
+                    line = "".join(runs).strip()
+                    if line:
+                        lines.append(f"- {line}")
+            lines.append("")
+    return "\n".join(lines).strip() or "# 未能从 PPT 中提取到文字内容"
+
+
+def xlsx_to_markdown(real_path):
+    with zipfile.ZipFile(real_path, "r") as zf:
+        shared = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            sroot = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in sroot.iter():
+                if si.tag.endswith("}si"):
+                    txt = "".join(t.text for t in si.iter() if t.tag.endswith("}t") and t.text)
+                    shared.append(txt)
+        sheets = sorted([n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")])
+        if not sheets:
+            return "# 未找到工作表内容"
+        wroot = ET.fromstring(zf.read(sheets[0]))
+        rows = []
+        for row in wroot.iter():
+            if not row.tag.endswith("}row"):
+                continue
+            if len(rows) >= 80:
+                break
+            cells = []
+            for c in row:
+                if not c.tag.endswith("}c"):
+                    continue
+                ctype = c.attrib.get("t", "")
+                val = ""
+                for v in c:
+                    if v.tag.endswith("}v") and v.text:
+                        val = v.text
+                    elif v.tag.endswith("}is"):
+                        val = "".join(t.text for t in v.iter() if t.tag.endswith("}t") and t.text)
+                if ctype == "s":
+                    try:
+                        val = shared[int(val)]
+                    except Exception:
+                        pass
+                cells.append(str(val).replace("\n", " ").replace("|", "\\|"))
+            if cells:
+                rows.append(cells)
+        if not rows:
+            return "# 表格为空"
+        col_cnt = max(len(r) for r in rows)
+        norm_rows = [r + [""] * (col_cnt - len(r)) for r in rows]
+        out = [
+            "| " + " | ".join(norm_rows[0]) + " |",
+            "| " + " | ".join(["---"] * col_cnt) + " |",
+        ]
+        for r in norm_rows[1:]:
+            out.append("| " + " | ".join(r) + " |")
+        return "\n".join(out)
+
+
+def build_native_open_uri(info):
+    if not info or not info.get("path"):
+        return ""
+    real = info["path"]
+    ext = (info.get("ext") or "").lower()
+    if ext in (".docx", ".pptx", ".xlsx"):
+        try:
+            dirs = find_app_data_dirs()
+            base = dirs[0] if dirs else (Path.home() / ".gemini" / "antigravity")
+            cache_dir = base / "preview_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            stem = os.path.splitext(os.path.basename(real))[0]
+            out_md = cache_dir / f"{stem}.md"
+            if ext == ".docx":
+                md_text = docx_to_markdown(real)
+            elif ext == ".pptx":
+                md_text = pptx_to_markdown(real)
+            else:
+                md_text = xlsx_to_markdown(real)
+            out_md.write_text(md_text, encoding="utf-8")
+            return out_md.resolve().as_uri()
+        except Exception:
+            return info.get("fileUri") or ""
+    return info.get("fileUri") or ""
+
+
 def generate_file_preview(target_path):
     if not target_path:
         return {"ok": False, "error": "未提供文件路径"}
@@ -1193,12 +1494,21 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 f for f in collect_recent_project_files(cfg.get("watchedDirs"), 80)
                 if f["path"].lower() not in sent_lower_set and "\\.user_uploaded\\" not in f["path"].lower()
             ]
+            pinned_set = {os.path.normpath(p).lower() for p in cfg.get("pinnedFiles", []) if p}
+            archived_set = {os.path.normpath(p).lower() for p in cfg.get("archivedFiles", []) if p}
             pinned_files = [
                 info for p in cfg.get("pinnedFiles", [])
                 if (info := describe_file(p, action_kind="pinned")) is not None
             ]
-            for flist in (session_files, sent_files, recent_files, pinned_files):
+            archived_files = [
+                info for p in cfg.get("archivedFiles", [])
+                if (info := describe_file(p, action_kind="archived")) is not None
+            ]
+            for flist in (session_files, sent_files, recent_files, pinned_files, archived_files):
                 for item in flist:
+                    low_p = item["path"].lower()
+                    item["isPinned"] = low_p in pinned_set
+                    item["isArchived"] = low_p in archived_set
                     item["matchedApps"] = get_matched_apps_for_ext(item.get("ext", ""), apps)
             ipc = read_ipc_state()
             pending_doc = None
@@ -1221,6 +1531,7 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 "sentFiles": sent_files,
                 "recentFiles": recent_files,
                 "pinnedFiles": pinned_files,
+                "archivedFiles": archived_files,
                 "pendingInternalOpen": pending_doc,
             })
             return
@@ -1232,8 +1543,14 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": False, "error": "文件不存在"})
                 return
             info["matchedApps"] = get_matched_apps_for_ext(info.get("ext", ""), detect_installed_apps())
+            native_uri = build_native_open_uri(info)
+            ipc_file = dict(info)
+            if native_uri and (info.get("ext") or "").lower() in (".docx", ".pptx", ".xlsx"):
+                ipc_file["fileUri"] = native_uri
+                ipc_file["openUri"] = native_uri
+                ipc_file["ext"] = ".md"
             ipc = read_ipc_state()
-            ipc["pendingInternalOpen"] = {"file": info, "ts": time.time()}
+            ipc["pendingInternalOpen"] = {"file": ipc_file, "ts": time.time()}
             write_ipc_state(ipc)
             sidecar_active = (time.time() - float(ipc.get("lastSidecarSeen") or 0)) < 10.0
             self._send_json(200, {
@@ -1286,6 +1603,17 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
 
             res = perform_file_action(target_path, mode=mode, app_id=app_id, custom_exe=custom_exe)
             self._send_json(200, res)
+            return
+
+        if route == "/api/batch":
+            op = query.get("op") or ""
+            raw_paths = query.get("paths") or query.get("path") or ""
+            try:
+                paths = json.loads(raw_paths) if raw_paths.startswith("[") else [p for p in raw_paths.split("|") if p]
+            except Exception:
+                paths = [raw_paths] if raw_paths else []
+            conv_id = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            self._send_json(200, perform_batch_action(op, paths, conv_id))
             return
 
         if route == "/api/pin":

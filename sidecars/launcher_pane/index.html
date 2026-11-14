@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>File Launcher</title>
-  <link rel="stylesheet" href="/styles.css?v=1.7" />
+  <link rel="stylesheet" href="/styles.css?v=1.8" />
   <style>
 /*
  * File Launcher — Codex Minimalist UI with Native Antigravity Light/Dark Theme Sync
@@ -682,6 +682,144 @@ html, body {
   margin-right: 4px;
 }
 
+
+/* Star / Pin button & badges */
+.star-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--fg-muted);
+  border-radius: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+  font-size: 13px;
+  transition: color 0.12s, background 0.12s;
+}
+.star-btn:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+.star-btn.pinned {
+  color: #f59e0b;
+}
+
+.pin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: 3px;
+  color: #d97706;
+  background: rgba(245, 158, 11, 0.12);
+  margin-left: 5px;
+  vertical-align: middle;
+}
+:root[data-theme="dark"] .pin-badge {
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.18);
+}
+
+.arch-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 0 5px;
+  border-radius: 3px;
+  color: var(--fg-secondary);
+  background: var(--bg-fill);
+  margin-left: 4px;
+  vertical-align: middle;
+}
+
+/* Multi-select Checkbox */
+.sel-check {
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  border: 1.5px solid var(--border-strong);
+  background: var(--bg-surface);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.sel-check.checked {
+  background: var(--fg-primary);
+  border-color: var(--fg-primary);
+  color: var(--bg-surface);
+}
+.codex-item.selected {
+  border-color: var(--fg-secondary);
+  background: var(--bg-hover);
+}
+
+/* Composite Action Bar at Bottom */
+.composite-bar {
+  position: fixed;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--menu-shadow);
+  z-index: 250;
+}
+.comp-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--fg-primary);
+}
+.comp-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.comp-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 5px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-fill);
+  color: var(--fg-primary);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.comp-btn:hover {
+  background: var(--bg-active);
+}
+.comp-btn.primary {
+  background: var(--fg-primary);
+  color: var(--bg-surface);
+  border-color: var(--fg-primary);
+}
+.comp-btn.primary:hover {
+  opacity: 0.9;
+}
+
   </style>
   <script src="/preload.js"></script>
 </head>
@@ -696,8 +834,12 @@ html, body {
             <span id="countSession" class="seg-count">0</span>
           </button>
           <button id="tabSent" class="seg-btn" data-tab="sent" title="单独隔离：仅显示您发送或上传给 Antigravity 的文件">
-            <span>我发送的文件</span>
+            <span>我发送的</span>
             <span id="countSent" class="seg-count">0</span>
+          </button>
+          <button id="tabPinned" class="seg-btn" data-tab="pinned" title="收藏保留区：防止上下文压缩吞掉重要文件">
+            <span>★ 收藏保留</span>
+            <span id="countPinned" class="seg-count">0</span>
           </button>
           <button id="tabRecent" class="seg-btn" data-tab="recent" title="工作区中的最近项目文档">
             <span>最近项目</span>
@@ -705,11 +847,14 @@ html, body {
           </button>
         </div>
         <div class="header-right">
+          <button id="selectModeBtn" class="icon-btn" title="进入多选模式：批量收藏(防压缩)、归档或加入对话框">
+            <span>选择</span>
+          </button>
           <button id="sortTimeBtn" class="icon-btn active" title="点击切换时间排序方向（最新优先 / 最早优先）">
-            <span id="sortTimeLabel">按时间: 最新↓</span>
+            <span id="sortTimeLabel">时间↓</span>
           </button>
           <button id="groupToggleBtn" class="icon-btn active" title="按文件类型分组显示">
-            <span>按类型分组</span>
+            <span>分组</span>
           </button>
           <button id="refreshBtn" class="icon-btn" title="刷新列表">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" class="svg-icon">
@@ -738,6 +883,19 @@ html, body {
       <main id="fileListContainer" class="codex-list">
         <div class="empty-box">正在加载文件列表...</div>
       </main>
+
+      <!-- Bottom Composite Action Bar (shown when in Select Mode) -->
+      <div id="compositeBar" class="composite-bar hidden">
+        <div class="comp-left">
+          <button id="selAllBtn" class="comp-btn">全选</button>
+          <span id="selCountLabel">已选 0 项</span>
+        </div>
+        <div class="comp-actions">
+          <button id="batchPinBtn" class="comp-btn" title="收藏所选文件并写入防压缩保护清单">★ 收藏(防压缩)</button>
+          <button id="batchArchiveBtn" class="comp-btn" title="归档备份到 D:\projects\Archived_Docs">📦 归档</button>
+          <button id="batchChatBtn" class="comp-btn primary" title="复制所选文件的 @路径 引用以便粘贴到对话框">💬 加入对话框</button>
+        </div>
+      </div>
     </div>
 
     <!-- Antigravity Internal Document Reader View -->
@@ -762,6 +920,6 @@ html, body {
     <div id="toastMsg" class="toast-msg hidden"></div>
   </div>
 
-  <script src="/app.js?v=1.7"></script>
+  <script src="/app.js?v=1.8"></script>
 </body>
 </html>
