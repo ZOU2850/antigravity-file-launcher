@@ -871,10 +871,6 @@ def get_matched_apps_for_ext(ext, all_apps):
     for aid in allowed_ids:
         if aid in by_id:
             matched.append({"id": aid, "name": by_id[aid]["name"]})
-    # Also include any user-added custom apps
-    for a in (all_apps or []):
-        if a.get("id") not in ("default", "open_with_dialog", "explorer", "powershell", "word", "excel", "powerpoint", "wps", "vscode", "cursor", "antigravity", "edge", "chrome", "notepad"):
-            matched.append({"id": a["id"], "name": a["name"]})
     return matched
 
 

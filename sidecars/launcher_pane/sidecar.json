@@ -15,11 +15,6 @@
         "path": "/",
         "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
         "title": "File Launcher"
-      },
-      {
-        "path": "/?view=sidebar",
-        "entrypoint": "SIDECAR_UI_ENTRYPOINT_SIDEBAR",
-        "title": "File Launcher"
       }
     ]
   }

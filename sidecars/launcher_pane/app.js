@@ -18,9 +18,16 @@
     showToast._t = setTimeout(() => t.classList.add("hidden"), 1800);
   }
 
+  function sidecarFetch(url, opts) {
+    if (window.sidecar && typeof window.sidecar.fetch === "function") {
+      return window.sidecar.fetch(url, opts);
+    }
+    return fetch(url, opts);
+  }
+
   function getConversationId() {
-    if (window.antigravity && window.antigravity.conversationId) {
-      return window.antigravity.conversationId;
+    if (window.sidecar && window.sidecar.conversationId) {
+      return window.sidecar.conversationId;
     }
     const params = new URLSearchParams(window.location.search);
     return params.get("conversationId") || "";
@@ -50,7 +57,7 @@
         mode: mode || "default",
         appId: appId || "",
       });
-      const res = await fetch("/api/open?" + q.toString());
+      const res = await sidecarFetch("/api/open?" + q.toString());
       const data = await res.json();
       if (data.ok) {
         if (mode === "reveal") showToast("已在文件资源管理器中定位");
@@ -195,7 +202,7 @@
   async function fetchState(manual) {
     try {
       const convId = getConversationId();
-      const res = await fetch("/api/state?conversationId=" + encodeURIComponent(convId));
+      const res = await sidecarFetch("/api/state?conversationId=" + encodeURIComponent(convId));
       const data = await res.json();
       if (!data.ok) return;
       state.sessionFiles = data.sessionFiles || [];
