@@ -29,12 +29,15 @@ HERE = Path(__file__).resolve().parent
 IS_WIN = platform.system().lower() == "windows"
 ID_RE = re.compile(r"^[0-9a-f-]{8,}$", re.IGNORECASE)
 
-# 默认只展示对普通用户可读的成品文档与媒体文件（不显示 .py, .css, .js, .json 等代码文件）
-DELIVERABLE_EXTS = {
+# 默认只展示对普通用户可读的成品文档与媒体文件；代码/配置在侧边栏仅作为单独分类标签按需查看
+READABLE_EXTS = {
     ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".csv", ".pdf",
-    ".md", ".txt", ".rtf",
+    ".md", ".txt", ".rtf", ".html", ".htm",
     ".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif",
-    ".mp4", ".mp3", ".wav", ".zip"
+    ".mp4", ".mp3", ".wav"
+}
+DELIVERABLE_EXTS = READABLE_EXTS | {
+    ".py", ".js", ".mjs", ".ts", ".css", ".json", ".ps1", ".xml", ".yaml", ".yml", ".zip"
 }
 
 CATEGORY_MAP = {
@@ -144,6 +147,11 @@ def save_user_config(cfg):
     except Exception:
         return False
 
+
+
+LAST_SIDECAR_SEEN = 0.0
+PENDING_INTERNAL_OPEN = None
+INTERNAL_LOCK = None
 
 _CACHED_APPS = None
 _CACHED_APPS_AT = 0.0
@@ -302,6 +310,30 @@ def file_uri_to_local_path(uri_str):
         return ""
 
 
+
+FILE_TYPE_GROUPS = [
+    ("word", "Word", {".docx", ".doc", ".rtf"}),
+    ("markdown", "Markdown", {".md"}),
+    ("ppt", "PPT", {".pptx", ".ppt"}),
+    ("excel", "Excel", {".xlsx", ".xls", ".csv"}),
+    ("pdf", "PDF", {".pdf"}),
+    ("image", "图片", {".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif"}),
+    ("text", "文本/网页", {".txt", ".html", ".htm"}),
+]
+
+
+def classify_extension(ext, is_dir=False):
+    if is_dir:
+        return "other", "文件夹", False
+    e = (ext or "").lower()
+    for cid, clabel, exts in FILE_TYPE_GROUPS:
+        if e in exts:
+            return cid, clabel, True
+    if e in (".mp4", ".mp3", ".wav"):
+        return "media", "音视频", True
+    return "code", "代码/其他", False
+
+
 def describe_file(raw_path, action_kind="recent", step_index=-1):
     if not raw_path or not isinstance(raw_path, str):
         return None
@@ -343,6 +375,9 @@ def describe_file(raw_path, action_kind="recent", step_index=-1):
         "priority": cat["priority"],
         "actionKind": action_kind,
         "stepIndex": step_index,
+        "category": classify_extension(ext, is_dir)[0],
+        "categoryLabel": classify_extension(ext, is_dir)[1],
+        "isReadable": classify_extension(ext, is_dir)[2],
     }
 
 
@@ -849,8 +884,8 @@ EXT_APP_MAP = {
     ".csv":  ["excel", "wps", "notepad", "vscode"],
     ".pptx": ["powerpoint", "wps"],
     ".ppt":  ["powerpoint", "wps"],
-    ".md":   ["notepad", "vscode", "cursor", "antigravity", "word", "wps"],
-    ".txt":  ["notepad", "vscode", "cursor", "antigravity"],
+    ".md":   ["notepad", "vscode", "cursor", "word", "wps"],
+    ".txt":  ["notepad", "vscode", "cursor", "notepadpp"],
     ".pdf":  ["edge", "chrome", "wps"],
     ".html": ["edge", "chrome", "vscode", "notepad"],
     ".htm":  ["edge", "chrome", "vscode", "notepad"],
@@ -859,13 +894,20 @@ EXT_APP_MAP = {
     ".jpeg": ["edge", "chrome"],
     ".webp": ["edge", "chrome"],
     ".svg":  ["edge", "chrome", "vscode"],
+    ".py":   ["vscode", "cursor", "notepadpp", "notepad"],
+    ".js":   ["vscode", "cursor", "notepadpp", "notepad"],
+    ".mjs":  ["vscode", "cursor", "notepadpp", "notepad"],
+    ".ts":   ["vscode", "cursor", "notepadpp", "notepad"],
+    ".css":  ["vscode", "cursor", "notepadpp", "notepad"],
+    ".json": ["vscode", "cursor", "notepadpp", "notepad"],
+    ".ps1":  ["vscode", "notepadpp", "notepad"],
 }
 
 
 def get_matched_apps_for_ext(ext, all_apps):
     """Return only the installed desktop apps that genuinely support this file extension."""
     ext = (ext or "").lower()
-    allowed_ids = EXT_APP_MAP.get(ext, ["notepad", "vscode", "antigravity"])
+    allowed_ids = EXT_APP_MAP.get(ext, ["notepad", "vscode", "cursor"])
     by_id = {a["id"]: a for a in (all_apps or [])}
     matched = []
     for aid in allowed_ids:
@@ -931,6 +973,9 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/state":
+            global LAST_SIDECAR_SEEN, PENDING_INTERNAL_OPEN
+            if query.get("client") == "sidecar":
+                LAST_SIDECAR_SEEN = time.time()
             req_conv = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
             app_data, conv_id = resolve_active_conversation(req_conv)
             cfg = load_user_config()
@@ -944,6 +989,10 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             for flist in (session_files, recent_files, pinned_files):
                 for item in flist:
                     item["matchedApps"] = get_matched_apps_for_ext(item.get("ext", ""), apps)
+            pending_doc = None
+            if query.get("client") == "sidecar" and PENDING_INTERNAL_OPEN:
+                pending_doc = PENDING_INTERNAL_OPEN
+                PENDING_INTERNAL_OPEN = None
             self._send_json(200, {
                 "ok": True,
                 "conversationId": conv_id,
@@ -953,6 +1002,23 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 "sessionFiles": session_files,
                 "recentFiles": recent_files,
                 "pinnedFiles": pinned_files,
+                "pendingInternalOpen": pending_doc,
+            })
+            return
+
+        if route == "/api/internal-open":
+            target_path = query.get("path") or ""
+            info = describe_file(target_path, action_kind="linked")
+            if not info:
+                self._send_json(200, {"ok": False, "error": "文件不存在"})
+                return
+            info["matchedApps"] = get_matched_apps_for_ext(info.get("ext", ""), detect_installed_apps())
+            PENDING_INTERNAL_OPEN = {"file": info, "ts": time.time()}
+            sidecar_active = (time.time() - LAST_SIDECAR_SEEN) < 8.0
+            self._send_json(200, {
+                "ok": True,
+                "sidecarActive": sidecar_active,
+                "file": info,
             })
             return
 

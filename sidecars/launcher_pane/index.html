@@ -5,24 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>File Launcher</title>
   <style>/* ==========================================================================
-   Codex Pure Style — Minimal, Professional, Zero Clutter
+   File Launcher — Codex Pure Style with Type Classification & Internal Open
    ========================================================================== */
 :root {
   --bg-page: #0d0d0f;
+  --bg-header: #121215;
   --bg-row: #16161a;
   --bg-row-hover: #1d1d22;
   --bg-menu: #1c1c21;
   --bg-menu-hover: #2a2a32;
+  --bg-doc: #111114;
   --border-subtle: #26262c;
   --border-strong: #363640;
   --fg-main: #f4f4f6;
-  --fg-sub: #9ca3af;
-  --fg-muted: #6b7280;
+  --fg-sub: #a1a1aa;
+  --fg-muted: #71717a;
 }
 
-* {
-  box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
 html, body {
   margin: 0 !important;
@@ -52,9 +52,10 @@ html, body {
   justify-content: space-between;
   gap: 8px;
   padding: 8px 12px;
-  background: #121215;
+  background: var(--bg-header);
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
 
 .seg-tabs {
@@ -98,7 +99,7 @@ html, body {
 }
 
 .filter-input {
-  width: 130px;
+  width: 124px;
   height: 26px;
   padding: 0 8px;
   background: #09090b;
@@ -109,45 +110,139 @@ html, body {
   outline: none;
 }
 
-.filter-input:focus {
-  border-color: var(--border-strong);
-}
+.filter-input:focus { border-color: var(--border-strong); }
 
 .icon-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
+  gap: 4px;
   height: 26px;
+  padding: 0 7px;
   border-radius: 5px;
   border: 1px solid var(--border-subtle);
   background: var(--bg-row);
   color: var(--fg-sub);
+  font-size: 11.5px;
+  font-weight: 500;
   cursor: pointer;
 }
 
-.icon-btn:hover {
-  background: var(--bg-row-hover);
+.icon-btn:hover, .icon-btn.active {
+  background: #23232a;
   color: var(--fg-main);
+  border-color: var(--border-strong);
 }
 
-/* File List */
+/* File Type Category Strip */
+.cat-strip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 12px;
+  background: #0f0f12;
+  border-bottom: 1px solid var(--border-subtle);
+  overflow-x: auto;
+  flex-shrink: 0;
+  scrollbar-width: none;
+}
+.cat-strip::-webkit-scrollbar { display: none; }
+
+.cat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 23px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-row);
+  color: var(--fg-sub);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.12s;
+}
+
+.cat-pill:hover {
+  color: var(--fg-main);
+  border-color: var(--border-strong);
+}
+
+.cat-pill.active {
+  background: #f4f4f6;
+  color: #0d0d0f;
+  border-color: #f4f4f6;
+  font-weight: 600;
+}
+
+.cat-num {
+  font-size: 10.5px;
+  opacity: 0.72;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+/* File List Container */
 .codex-list {
   flex: 1;
   overflow-y: auto;
-  padding: 10px 12px 24px;
+  padding: 10px 12px 40px;
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
+/* Category Section Group */
+.group-block {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+
+.group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-sub);
+  cursor: pointer;
+  user-select: none;
+}
+
+.group-head:hover { color: var(--fg-main); }
+
+.group-head-left {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.group-caret {
+  width: 12px;
+  height: 12px;
+  transition: transform 0.15s;
+}
+.group-block.collapsed .group-caret { transform: rotate(-90deg); }
+.group-block.collapsed .group-items { display: none; }
+
+.group-items {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+/* File Row */
 .codex-item {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 8px 10px;
+  padding: 7px 10px;
   background: var(--bg-row);
   border: 1px solid var(--border-subtle);
   border-radius: 7px;
@@ -159,7 +254,6 @@ html, body {
   border-color: var(--border-strong);
 }
 
-/* Clickable File Main Area (Click to open directly) */
 .item-main {
   display: flex;
   align-items: center;
@@ -181,17 +275,18 @@ html, body {
   font-weight: 700;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   text-transform: uppercase;
-  background: rgba(59, 130, 246, 0.14);
-  color: #60a5fa;
-  border: 1px solid rgba(59, 130, 246, 0.28);
+  background: rgba(113, 113, 122, 0.18);
+  color: #d4d4d8;
+  border: 1px solid rgba(113, 113, 122, 0.35);
   flex-shrink: 0;
 }
 
 .ext-pill.word { background: rgba(59, 130, 246, 0.14); color: #60a5fa; border-color: rgba(59, 130, 246, 0.28); }
-.ext-pill.md { background: rgba(168, 85, 247, 0.14); color: #c084fc; border-color: rgba(168, 85, 247, 0.28); }
+.ext-pill.markdown { background: rgba(168, 85, 247, 0.14); color: #c084fc; border-color: rgba(168, 85, 247, 0.28); }
 .ext-pill.ppt { background: rgba(245, 158, 11, 0.14); color: #fbbf24; border-color: rgba(245, 158, 11, 0.28); }
 .ext-pill.excel { background: rgba(16, 185, 129, 0.14); color: #34d399; border-color: rgba(16, 185, 129, 0.28); }
 .ext-pill.pdf { background: rgba(239, 68, 68, 0.14); color: #f87171; border-color: rgba(239, 68, 68, 0.28); }
+.ext-pill.image { background: rgba(6, 182, 212, 0.14); color: #22d3ee; border-color: rgba(6, 182, 212, 0.28); }
 
 .item-text {
   min-width: 0;
@@ -199,7 +294,7 @@ html, body {
 }
 
 .item-name {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 500;
   color: var(--fg-main);
   white-space: nowrap;
@@ -222,7 +317,7 @@ html, body {
   text-overflow: ellipsis;
 }
 
-/* Right Side: ONLY "打开方式 ▾" */
+/* Open With Dropdown */
 .open-with-wrap {
   position: relative;
   flex-shrink: 0;
@@ -232,7 +327,7 @@ html, body {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  height: 26px;
+  height: 25px;
   padding: 0 9px;
   background: #222228;
   color: var(--fg-main);
@@ -242,16 +337,13 @@ html, body {
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
-  transition: background 0.12s;
 }
 
-.open-with-btn:hover {
-  background: #2c2c34;
-}
+.open-with-btn:hover { background: #2c2c34; }
 
 .svg-caret {
-  width: 12px;
-  height: 12px;
+  width: 11px;
+  height: 11px;
   fill: none;
   stroke: currentColor;
   stroke-width: 2;
@@ -259,22 +351,21 @@ html, body {
   stroke-linejoin: round;
 }
 
-/* Custom Dropdown Menu */
 .dropdown-menu {
   position: absolute;
   right: 0;
   top: calc(100% + 4px);
-  min-width: 185px;
+  min-width: 192px;
   background: var(--bg-menu);
   border: 1px solid var(--border-strong);
   border-radius: 7px;
   padding: 4px;
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.65);
   z-index: 99;
 }
 
 .menu-section-label {
-  padding: 4px 8px 2px;
+  padding: 3px 8px 2px;
   font-size: 10.5px;
   font-weight: 600;
   color: var(--fg-muted);
@@ -302,11 +393,87 @@ html, body {
   color: #ffffff;
 }
 
+.menu-tag {
+  font-size: 10px;
+  color: var(--fg-sub);
+  background: #27272e;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
 .menu-divider {
   height: 1px;
   margin: 4px 2px;
   background: var(--border-subtle);
 }
+
+/* Antigravity Internal Document View (for .docx / .pptx / .xlsx) */
+.internal-doc-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-doc);
+}
+
+.doc-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+
+.doc-topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.doc-topbar-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.doc-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 20px;
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: #e4e4e7;
+}
+
+.doc-h1 {
+  font-size: 17px;
+  font-weight: 700;
+  color: #f4f4f6;
+  margin: 0 0 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.doc-h2 {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: #f4f4f6;
+  margin: 14px 0 6px;
+}
+.doc-p { margin: 0 0 8px; color: #d4d4d8; }
+.doc-table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 12.5px; }
+.doc-table th, .doc-table td { border: 1px solid var(--border-strong); padding: 6px 8px; text-align: left; }
+.doc-table th { background: var(--bg-row); }
+.slide-card { background: var(--bg-row); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
+.slide-badge { font-size: 11px; font-weight: 600; color: #fbbf24; margin-bottom: 4px; }
+.doc-code { background: var(--bg-row); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 10px; overflow-x: auto; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 
 .empty-box {
   text-align: center;
@@ -329,47 +496,104 @@ html, body {
   z-index: 200;
 }
 
-.hidden {
-  display: none !important;
-}
+.hidden { display: none !important; }
 </style>
   <script src="/preload.js"></script>
 </head>
 <body>
   <div class="codex-shell">
-    <header class="codex-header">
-      <div class="seg-tabs">
-        <button class="seg-tab active" id="tabSession">
-          <span>当前文档</span>
-          <span class="seg-count" id="countSession">0</span>
-        </button>
-        <button class="seg-tab" id="tabRecent">
-          <span>最近文档</span>
-          <span class="seg-count" id="countRecent">0</span>
-        </button>
+    <!-- List View Wrapper -->
+    <div id="listViewWrap" style="display:flex;flex-direction:column;height:100%;overflow:hidden;">
+      <header class="codex-header">
+        <div class="seg-tabs">
+          <button class="seg-tab active" id="tabSession">
+            <span>当前文档</span>
+            <span class="seg-count" id="countSession">0</span>
+          </button>
+          <button class="seg-tab" id="tabRecent">
+            <span>最近文档</span>
+            <span class="seg-count" id="countRecent">0</span>
+          </button>
+        </div>
+        <div class="header-right">
+          <input type="text" id="searchInput" class="filter-input" placeholder="筛选文件..." />
+          <button class="icon-btn active" id="groupToggleBtn" title="按文件类型分组显示">分类</button>
+          <button class="icon-btn" id="refreshBtn" title="刷新">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- File Type Classification Strip -->
+      <div class="cat-strip" id="catStrip"></div>
+
+      <main class="codex-list" id="fileListContainer">
+        <div class="empty-box">正在加载...</div>
+      </main>
+    </div>
+
+    <!-- Antigravity Internal Document View (Opened cleanly when choosing Antigravity 内部打开) -->
+    <section id="internalDocView" class="internal-doc-view hidden">
+      <div class="doc-topbar">
+        <div class="doc-topbar-left">
+          <button class="icon-btn" id="docBackBtn" title="返回文件列表">← 返回</button>
+          <span class="doc-topbar-title" id="docTopTitle">文档</span>
+        </div>
+        <div class="open-with-wrap">
+          <button class="open-with-btn" id="docMenuBtn">
+            <span>打开方式</span>
+            <svg viewBox="0 0 24 24" class="svg-caret"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+          <div class="dropdown-menu hidden" id="docMenuDrop"></div>
+        </div>
       </div>
-      <div class="header-right">
-        <input type="text" id="searchInput" class="filter-input" placeholder="筛选文档..." />
-        <button class="icon-btn" id="refreshBtn" title="刷新">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
-        </button>
-      </div>
-    </header>
-    <main class="codex-list" id="fileListContainer">
-      <div class="empty-box">正在加载...</div>
-    </main>
+      <div class="doc-content" id="docContent"></div>
+    </section>
+
     <div class="toast hidden" id="toastMsg">已执行</div>
   </div>
   <script>(function () {
+  const NATIVE_FILEVIEW_EXTS = new Set([
+    ".md", ".txt", ".json", ".py", ".js", ".mjs", ".ts", ".css", ".ps1",
+    ".xml", ".yaml", ".yml", ".log", ".csv", ".html", ".htm",
+    ".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif"
+  ]);
+
+  const CATEGORY_ORDER = ["word", "markdown", "ppt", "excel", "pdf", "image", "text", "media", "code", "other"];
+  const CATEGORY_LABELS = {
+    all: "全部文档",
+    word: "Word",
+    markdown: "Markdown",
+    ppt: "PPT",
+    excel: "Excel",
+    pdf: "PDF",
+    image: "图片",
+    text: "文本/网页",
+    media: "音视频",
+    code: "代码/其他",
+    other: "文件夹"
+  };
+
   let state = {
     tab: "session",
+    category: "all",
+    groupByType: true,
     search: "",
     sessionFiles: [],
     recentFiles: [],
     openMenuPath: null,
+    collapsedGroups: new Set(),
+    activeInternalDoc: null,
   };
 
   const el = (id) => document.getElementById(id);
+
+  function sidecarFetch(url, opts) {
+    if (window.sidecar && typeof window.sidecar.fetch === "function") {
+      return window.sidecar.fetch(url, opts);
+    }
+    return fetch(url, opts);
+  }
 
   function showToast(msg) {
     const t = el("toastMsg");
@@ -377,14 +601,7 @@ html, body {
     t.textContent = msg;
     t.classList.remove("hidden");
     clearTimeout(showToast._t);
-    showToast._t = setTimeout(() => t.classList.add("hidden"), 1800);
-  }
-
-  function sidecarFetch(url, opts) {
-    if (window.sidecar && typeof window.sidecar.fetch === "function") {
-      return window.sidecar.fetch(url, opts);
-    }
-    return fetch(url, opts);
+    showToast._t = setTimeout(() => t.classList.add("hidden"), 2000);
   }
 
   function getConversationId() {
@@ -395,15 +612,6 @@ html, body {
     return params.get("conversationId") || "";
   }
 
-  function pillClass(ext) {
-    if (ext === ".docx" || ext === ".doc") return "ext-pill word";
-    if (ext === ".pptx" || ext === ".ppt") return "ext-pill ppt";
-    if (ext === ".xlsx" || ext === ".xls" || ext === ".csv") return "ext-pill excel";
-    if (ext === ".md") return "ext-pill md";
-    if (ext === ".pdf") return "ext-pill pdf";
-    return "ext-pill";
-  }
-
   function esc(s) {
     return String(s || "")
       .replace(/&/g, "&amp;")
@@ -412,7 +620,14 @@ html, body {
       .replace(/"/g, "&quot;");
   }
 
-  async function triggerOpen(filePath, mode, appId) {
+  function formatSize(bytes) {
+    if (!bytes || bytes <= 0) return "";
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
+  async function triggerExternalOpen(filePath, mode, appId) {
     try {
       const q = new URLSearchParams({
         path: filePath,
@@ -433,7 +648,78 @@ html, body {
     }
   }
 
-  // Close open dropdown when clicking outside
+  // Open directly inside Antigravity!
+  // - Native readable formats (.md, .txt, images, code) -> window.sidecar.ui.toggleAuxPane({ tabType: 'fileView', uri })
+  // - Office formats (.docx, .pptx, .xlsx, .pdf) -> built-in Antigravity Doc View cleanly inside the pane (no "Preview is not available"!)
+  async function openInsideAntigravity(f) {
+    if (!f || !f.path) return;
+    const ext = (f.ext || "").toLowerCase();
+
+    if (NATIVE_FILEVIEW_EXTS.has(ext) && window.sidecar && window.sidecar.ui && typeof window.sidecar.ui.toggleAuxPane === "function" && f.fileUri) {
+      try {
+        window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri: f.fileUri });
+        showToast("已在 Antigravity 内打开");
+        return;
+      } catch (e) {
+        console.warn("toggleAuxPane fallback:", e);
+      }
+    }
+
+    // Fallback or Office (.docx / .pptx / .xlsx / .pdf): render inside Antigravity internal doc view
+    state.activeInternalDoc = f;
+    el("listViewWrap").classList.add("hidden");
+    el("internalDocView").classList.remove("hidden");
+    el("docTopTitle").textContent = f.name;
+    el("docContent").innerHTML = '<div class="empty-box">正在加载文档内容...</div>';
+
+    // Populate header "打开方式" menu in internal doc view
+    const docMenu = el("docMenuDrop");
+    const matched = Array.isArray(f.matchedApps) ? f.matchedApps : [];
+    const appBtns = matched
+      .map((a) => `<button class="menu-item" data-mode="app" data-app="${esc(a.id)}"><span>${esc(a.name)}</span></button>`)
+      .join("");
+    docMenu.innerHTML = `
+      ${appBtns ? `<div class="menu-section-label">匹配的应用</div>${appBtns}<div class="menu-divider"></div>` : ""}
+      <button class="menu-item" data-mode="reveal"><span>文件资源管理器</span></button>
+      <button class="menu-item" data-mode="open_with_dialog"><span>选择打开方式...</span></button>
+    `;
+    docMenu.querySelectorAll(".menu-item").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        docMenu.classList.add("hidden");
+        triggerExternalOpen(f.path, btn.getAttribute("data-mode"), btn.getAttribute("data-app") || "");
+      });
+    });
+
+    try {
+      const res = await sidecarFetch("/api/preview?path=" + encodeURIComponent(f.path));
+      const d = await res.json();
+      if (!d.ok) {
+        el("docContent").innerHTML = `<div class="empty-box">${esc(d.error || "无法加载")}</div>`;
+        return;
+      }
+      if (d.kind === "image") {
+        el("docContent").innerHTML = `<div style="text-align:center;"><img src="${d.rawUrl}" style="max-width:100%;border-radius:6px;border:1px solid var(--border-strong);" /></div>`;
+      } else {
+        el("docContent").innerHTML = d.html || '<div class="empty-box">暂无内容</div>';
+      }
+    } catch (err) {
+      el("docContent").innerHTML = `<div class="empty-box">读取失败: ${esc(err.message)}</div>`;
+    }
+  }
+
+  function closeInternalDocView() {
+    state.activeInternalDoc = null;
+    el("internalDocView").classList.add("hidden");
+    el("listViewWrap").classList.remove("hidden");
+  }
+
+  el("docBackBtn").addEventListener("click", closeInternalDocView);
+  el("docMenuBtn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    el("docMenuDrop").classList.toggle("hidden");
+  });
+
   document.addEventListener("click", (e) => {
     if (!e.target.closest(".open-with-wrap")) {
       state.openMenuPath = null;
@@ -445,19 +731,25 @@ html, body {
     state.tab = "session";
     el("tabSession").classList.add("active");
     el("tabRecent").classList.remove("active");
-    renderList();
+    renderAll();
   });
 
   el("tabRecent").addEventListener("click", () => {
     state.tab = "recent";
     el("tabRecent").classList.add("active");
     el("tabSession").classList.remove("active");
+    renderAll();
+  });
+
+  el("groupToggleBtn").addEventListener("click", () => {
+    state.groupByType = !state.groupByType;
+    el("groupToggleBtn").classList.toggle("active", state.groupByType);
     renderList();
   });
 
   el("searchInput").addEventListener("input", (e) => {
     state.search = (e.target.value || "").trim().toLowerCase();
-    renderList();
+    renderAll();
   });
 
   el("refreshBtn").addEventListener("click", () => {
@@ -465,115 +757,209 @@ html, body {
     showToast("已刷新");
   });
 
-  function renderList() {
-    const container = el("fileListContainer");
-    const raw = state.tab === "recent" ? state.recentFiles : state.sessionFiles;
-    const list = raw.filter((f) => {
-      if (!state.search) return true;
-      return ((f.name || "") + " " + (f.path || "")).toLowerCase().includes(state.search);
+  function getBaseFiles() {
+    return state.tab === "recent" ? state.recentFiles : state.sessionFiles;
+  }
+
+  function renderCategoryBar(baseFiles) {
+    const strip = el("catStrip");
+    const counts = { all: 0 };
+    baseFiles.forEach((f) => {
+      const cat = f.category || "other";
+      counts[cat] = (counts[cat] || 0) + 1;
+      if (f.isReadable) counts.all += 1;
     });
 
-    el("countSession").textContent = String((state.sessionFiles || []).length);
-    el("countRecent").textContent = String((state.recentFiles || []).length);
+    const pills = ["all", ...CATEGORY_ORDER.filter((c) => (counts[c] || 0) > 0)];
+    strip.innerHTML = "";
 
-    if (!list.length) {
-      container.innerHTML = `<div class="empty-box">暂无可读文档</div>`;
+    pills.forEach((cat) => {
+      const btn = document.createElement("button");
+      btn.className = "cat-pill" + (state.category === cat ? " active" : "");
+      btn.innerHTML = `<span>${esc(CATEGORY_LABELS[cat] || cat)}</span><span class="cat-num">${counts[cat] || 0}</span>`;
+      btn.addEventListener("click", () => {
+        state.category = cat;
+        renderAll();
+      });
+      strip.appendChild(btn);
+    });
+  }
+
+  function createItemElement(f) {
+    const item = document.createElement("div");
+    item.className = "codex-item";
+    const extLabel = f.isDir ? "DIR" : (f.ext || "FILE").replace(".", "").toUpperCase();
+    const matched = Array.isArray(f.matchedApps) ? f.matchedApps : [];
+    const sizeTxt = formatSize(f.size);
+
+    const appButtonsHtml = matched
+      .map((a) => `<button class="menu-item" data-mode="app" data-app="${esc(a.id)}"><span>${esc(a.name)}</span></button>`)
+      .join("");
+
+    const isMenuOpen = state.openMenuPath === f.path;
+    const shortDir = (f.dir || "").replace(/^D:\projects\?/i, "D:\projects\");
+
+    item.innerHTML = `
+      <div class="item-main" data-act="default-open" title="点击直接用默认程序打开">
+        <span class="ext-pill ${esc(f.category || "other")}">${esc(extLabel)}</span>
+        <div class="item-text">
+          <div class="item-name">${esc(f.name)}</div>
+          <div class="item-sub">${sizeTxt ? esc(sizeTxt) + " · " : ""}${esc(shortDir)}</div>
+        </div>
+      </div>
+      <div class="open-with-wrap">
+        <button class="open-with-btn" data-act="toggle-menu">
+          <span>打开方式</span>
+          <svg viewBox="0 0 24 24" class="svg-caret"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <div class="dropdown-menu ${isMenuOpen ? "" : "hidden"}">
+          <button class="menu-item" data-mode="antigravity_internal">
+            <span>Antigravity 内部打开</span>
+            <span class="menu-tag">内置</span>
+          </button>
+          <div class="menu-divider"></div>
+          ${matched.length ? `<div class="menu-section-label">匹配的应用</div>${appButtonsHtml}<div class="menu-divider"></div>` : ""}
+          <button class="menu-item" data-mode="reveal">
+            <span>文件资源管理器</span>
+          </button>
+          <button class="menu-item" data-mode="open_with_dialog">
+            <span>选择打开方式...</span>
+          </button>
+        </div>
+      </div>
+    `;
+
+    item.querySelector('[data-act="default-open"]').addEventListener("click", () => {
+      triggerExternalOpen(f.path, "default", "");
+    });
+
+    const menuEl = item.querySelector(".dropdown-menu");
+    item.querySelector('[data-act="toggle-menu"]').addEventListener("click", (e) => {
+      e.stopPropagation();
+      const willOpen = menuEl.classList.contains("hidden");
+      document.querySelectorAll(".dropdown-menu").forEach((m) => m.classList.add("hidden"));
+      if (willOpen) {
+        menuEl.classList.remove("hidden");
+        state.openMenuPath = f.path;
+      } else {
+        state.openMenuPath = null;
+      }
+    });
+
+    menuEl.querySelectorAll(".menu-item").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        menuEl.classList.add("hidden");
+        state.openMenuPath = null;
+        const mode = btn.getAttribute("data-mode");
+        const appId = btn.getAttribute("data-app") || "";
+        if (mode === "antigravity_internal") {
+          openInsideAntigravity(f);
+        } else {
+          triggerExternalOpen(f.path, mode, appId);
+        }
+      });
+    });
+
+    return item;
+  }
+
+  function renderList() {
+    const container = el("fileListContainer");
+    const baseFiles = getBaseFiles();
+
+    const filtered = baseFiles.filter((f) => {
+      if (state.search) {
+        const hay = ((f.name || "") + " " + (f.path || "") + " " + (f.categoryLabel || "")).toLowerCase();
+        if (!hay.includes(state.search)) return false;
+      } else if (state.category === "all") {
+        if (!f.isReadable) return false;
+      } else {
+        if ((f.category || "other") !== state.category) return false;
+      }
+      return true;
+    });
+
+    const readableSessionCount = (state.sessionFiles || []).filter((f) => f.isReadable).length;
+    const readableRecentCount = (state.recentFiles || []).filter((f) => f.isReadable).length;
+    el("countSession").textContent = String(readableSessionCount || (state.sessionFiles || []).length);
+    el("countRecent").textContent = String(readableRecentCount || (state.recentFiles || []).length);
+
+    if (!filtered.length) {
+      container.innerHTML = `<div class="empty-box">该分类下暂无文件</div>`;
       return;
     }
 
     container.innerHTML = "";
-    list.forEach((f) => {
-      const item = document.createElement("div");
-      item.className = "codex-item";
-      const extLabel = (f.ext || "FILE").replace(".", "").toUpperCase();
-      const matched = Array.isArray(f.matchedApps) ? f.matchedApps : [];
 
-      const appButtonsHtml = matched
-        .map(
-          (a) =>
-            `<button class="menu-item" data-mode="app" data-app="${esc(a.id)}"><span>${esc(a.name)}</span></button>`
-        )
-        .join("");
-
-      const isMenuOpen = state.openMenuPath === f.path;
-
-      item.innerHTML = `
-        <div class="item-main" data-act="default-open" title="点击直接打开 ${esc(f.name)}">
-          <span class="${pillClass(f.ext)}">${esc(extLabel)}</span>
-          <div class="item-text">
-            <div class="item-name">${esc(f.name)}</div>
-            <div class="item-sub">${esc(f.sizeText || "")} · ${esc(f.dir || "")}</div>
-          </div>
-        </div>
-        <div class="open-with-wrap">
-          <button class="open-with-btn" data-act="toggle-menu">
-            <span>打开方式</span>
-            <svg viewBox="0 0 24 24" class="svg-caret"><path d="m6 9 6 6 6-6"/></svg>
-          </button>
-          <div class="dropdown-menu ${isMenuOpen ? "" : "hidden"}">
-            ${
-              matched.length
-                ? `<div class="menu-section-label">匹配的应用</div>${appButtonsHtml}<div class="menu-divider"></div>`
-                : ""
-            }
-            <button class="menu-item" data-mode="reveal">
-              <span>文件资源管理器</span>
-            </button>
-            <button class="menu-item" data-mode="open_with_dialog">
-              <span>选择打开方式...</span>
-            </button>
-          </div>
-        </div>
-      `;
-
-      // Click left file area -> open directly with default app
-      item.querySelector('[data-act="default-open"]').addEventListener("click", () => {
-        triggerOpen(f.path, "default", "");
+    // Group by file type when viewing "all" and grouping is enabled
+    if (state.category === "all" && state.groupByType) {
+      const buckets = new Map();
+      filtered.forEach((f) => {
+        const key = f.category || "other";
+        if (!buckets.has(key)) buckets.set(key, []);
+        buckets.get(key).push(f);
       });
 
-      // Click "打开方式 ▾" -> toggle smart dropdown menu
-      const menuEl = item.querySelector(".dropdown-menu");
-      item.querySelector('[data-act="toggle-menu"]').addEventListener("click", (e) => {
-        e.stopPropagation();
-        const willOpen = menuEl.classList.contains("hidden");
-        document.querySelectorAll(".dropdown-menu").forEach((m) => m.classList.add("hidden"));
-        if (willOpen) {
-          menuEl.classList.remove("hidden");
-          state.openMenuPath = f.path;
-        } else {
-          state.openMenuPath = null;
-        }
-      });
+      CATEGORY_ORDER.forEach((catKey) => {
+        const groupFiles = buckets.get(catKey);
+        if (!groupFiles || !groupFiles.length) return;
 
-      // Menu item clicks
-      menuEl.querySelectorAll(".menu-item").forEach((btn) => {
-        btn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          menuEl.classList.add("hidden");
-          state.openMenuPath = null;
-          const mode = btn.getAttribute("data-mode");
-          const appId = btn.getAttribute("data-app") || "";
-          triggerOpen(f.path, mode, appId);
+        const block = document.createElement("div");
+        block.className = "group-block" + (state.collapsedGroups.has(catKey) ? " collapsed" : "");
+
+        const head = document.createElement("div");
+        head.className = "group-head";
+        head.innerHTML = `
+          <div class="group-head-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="group-caret"><path d="m6 9 6 6 6-6"/></svg>
+            <span>${esc(CATEGORY_LABELS[catKey] || catKey)}</span>
+            <span class="seg-count">(${groupFiles.length})</span>
+          </div>
+        `;
+        head.addEventListener("click", () => {
+          if (state.collapsedGroups.has(catKey)) state.collapsedGroups.delete(catKey);
+          else state.collapsedGroups.add(catKey);
+          block.classList.toggle("collapsed");
         });
-      });
 
-      container.appendChild(item);
-    });
+        const itemsWrap = document.createElement("div");
+        itemsWrap.className = "group-items";
+        groupFiles.forEach((f) => itemsWrap.appendChild(createItemElement(f)));
+
+        block.appendChild(head);
+        block.appendChild(itemsWrap);
+        container.appendChild(block);
+      });
+    } else {
+      filtered.forEach((f) => container.appendChild(createItemElement(f)));
+    }
+  }
+
+  function renderAll() {
+    renderCategoryBar(getBaseFiles());
+    renderList();
   }
 
   async function fetchState(manual) {
     try {
       const convId = getConversationId();
-      const res = await sidecarFetch("/api/state?conversationId=" + encodeURIComponent(convId));
+      const res = await sidecarFetch("/api/state?client=sidecar&conversationId=" + encodeURIComponent(convId));
       const data = await res.json();
       if (!data.ok) return;
+
       state.sessionFiles = data.sessionFiles || [];
       state.recentFiles = data.recentFiles || [];
 
       if (!manual && state.sessionFiles.length === 0 && state.recentFiles.length > 0 && state.tab === "session") {
-        state.sessionFiles = state.recentFiles.slice(0, 15);
+        state.sessionFiles = state.recentFiles.slice(0, 20);
       }
-      renderList();
+
+      if (data.pendingInternalOpen && data.pendingInternalOpen.file) {
+        openInsideAntigravity(data.pendingInternalOpen.file);
+      }
+
+      renderAll();
     } catch (err) {
       console.error("Failed to fetch state:", err);
     }
@@ -581,9 +967,8 @@ html, body {
 
   fetchState(false);
   setInterval(() => {
-    // Do not re-render while user has the dropdown menu open
     if (!state.openMenuPath) fetchState(false);
-  }, 3500);
+  }, 1500);
 })();
 </script>
 </body>
