@@ -1,7 +1,5 @@
 (function () {
   // ---------- Automatic Light/Dark Theme Sync with Antigravity ----------
-  // preload.js writes the host's tokens (--background, --foreground, etc.) onto :root.
-  // We compute luminance of --background to set data-theme="dark" or "light" automatically.
   function syncScheme() {
     try {
       const probe = document.createElement("span");
@@ -20,9 +18,7 @@
       if (document.documentElement.dataset.theme !== theme) {
         document.documentElement.dataset.theme = theme;
       }
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) {}
   }
 
   syncScheme();
@@ -54,15 +50,17 @@
     text: "文本/网页",
     media: "音视频",
     code: "代码/其他",
-    other: "文件夹"
+    other: "其他"
   };
 
   let state = {
+    // tab: "session" (AI产出) | "sent" (单独隔离：我发送的文件) | "recent" (最近项目)
     tab: "session",
     category: "all",
     groupByType: true,
     search: "",
     sessionFiles: [],
+    sentFiles: [],
     recentFiles: [],
     openMenuPath: null,
     collapsedGroups: new Set(),
@@ -108,6 +106,13 @@
     if (bytes < 1024) return bytes + " B";
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
     return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  }
+
+  function formatTime(ms) {
+    if (!ms) return "";
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
 
   async function triggerExternalOpen(filePath, mode, appId) {
@@ -198,6 +203,15 @@
     el("listViewWrap").classList.remove("hidden");
   }
 
+  function switchTab(nextTab) {
+    state.tab = nextTab;
+    state.category = "all";
+    el("tabSession").classList.toggle("active", nextTab === "session");
+    el("tabSent").classList.toggle("active", nextTab === "sent");
+    el("tabRecent").classList.toggle("active", nextTab === "recent");
+    renderAll();
+  }
+
   el("docBackBtn").addEventListener("click", closeInternalDocView);
   el("docMenuBtn").addEventListener("click", (e) => {
     e.stopPropagation();
@@ -211,19 +225,9 @@
     }
   });
 
-  el("tabSession").addEventListener("click", () => {
-    state.tab = "session";
-    el("tabSession").classList.add("active");
-    el("tabRecent").classList.remove("active");
-    renderAll();
-  });
-
-  el("tabRecent").addEventListener("click", () => {
-    state.tab = "recent";
-    el("tabRecent").classList.add("active");
-    el("tabSession").classList.remove("active");
-    renderAll();
-  });
+  el("tabSession").addEventListener("click", () => switchTab("session"));
+  el("tabSent").addEventListener("click", () => switchTab("sent"));
+  el("tabRecent").addEventListener("click", () => switchTab("recent"));
 
   el("groupToggleBtn").addEventListener("click", () => {
     state.groupByType = !state.groupByType;
@@ -241,8 +245,14 @@
     showToast("已刷新");
   });
 
+  // Strictly isolated data source per tab:
+  // - "sent" ONLY returns user-sent files (state.sentFiles)
+  // - "session" ONLY returns AI deliverables in current session
+  // - "recent" ONLY returns project files
   function getBaseFiles() {
-    return state.tab === "recent" ? state.recentFiles : state.sessionFiles;
+    if (state.tab === "sent") return state.sentFiles || [];
+    if (state.tab === "recent") return state.recentFiles || [];
+    return state.sessionFiles || [];
   }
 
   function renderCategoryBar(baseFiles) {
@@ -251,22 +261,38 @@
     baseFiles.forEach((f) => {
       const cat = f.category || "other";
       counts[cat] = (counts[cat] || 0) + 1;
-      if (f.isReadable) counts.all += 1;
+      if (state.tab === "sent" || f.isReadable) counts.all += 1;
     });
 
+    const allLabel = state.tab === "sent" ? "全部我发送的" : "全部文档";
     const pills = ["all", ...CATEGORY_ORDER.filter((c) => (counts[c] || 0) > 0)];
     strip.innerHTML = "";
 
     pills.forEach((cat) => {
       const btn = document.createElement("button");
       btn.className = "cat-pill" + (state.category === cat ? " active" : "");
-      btn.innerHTML = `<span>${esc(CATEGORY_LABELS[cat] || cat)}</span><span class="cat-num">${counts[cat] || 0}</span>`;
+      const label = cat === "all" ? allLabel : (CATEGORY_LABELS[cat] || cat);
+      btn.innerHTML = `<span>${esc(label)}</span><span class="cat-num">${counts[cat] || 0}</span>`;
       btn.addEventListener("click", () => {
         state.category = cat;
         renderAll();
       });
       strip.appendChild(btn);
     });
+
+    // Also provide an isolated quick-entry pill in the category bar when not in "sent" tab
+    if (state.tab !== "sent") {
+      const div = document.createElement("span");
+      div.className = "cat-divider";
+      strip.appendChild(div);
+
+      const sentBtn = document.createElement("button");
+      sentBtn.className = "cat-pill sent-isolated";
+      sentBtn.title = "单独查看我发送给 Antigravity 的文件（与产出文档完全隔离）";
+      sentBtn.innerHTML = `<span>我发送的文件</span><span class="cat-num">${(state.sentFiles || []).length}</span>`;
+      sentBtn.addEventListener("click", () => switchTab("sent"));
+      strip.appendChild(sentBtn);
+    }
   }
 
   function createItemElement(f) {
@@ -275,20 +301,26 @@
     const extLabel = f.isDir ? "DIR" : (f.ext || "FILE").replace(".", "").toUpperCase();
     const matched = Array.isArray(f.matchedApps) ? f.matchedApps : [];
     const sizeTxt = formatSize(f.size);
+    const timeTxt = formatTime(f.mtimeMs);
 
     const appButtonsHtml = matched
       .map((a) => `<button class="menu-item" data-mode="app" data-app="${esc(a.id)}"><span>${esc(a.name)}</span></button>`)
       .join("");
 
     const isMenuOpen = state.openMenuPath === f.path;
-    const shortDir = f.dir || "";
+    const isSent = Boolean(f.isUserSent) || state.tab === "sent";
+    const subParts = [];
+    if (isSent && f.sentScopeLabel) subParts.push(f.sentScopeLabel);
+    if (sizeTxt) subParts.push(sizeTxt);
+    if (timeTxt) subParts.push(timeTxt);
+    if (!isSent && f.dir) subParts.push(f.dir);
 
     item.innerHTML = `
       <div class="item-main" data-act="default-open" title="点击直接用默认程序打开">
         <span class="ext-pill ${esc(f.category || "other")}">${esc(extLabel)}</span>
         <div class="item-text">
           <div class="item-name">${esc(f.name)}</div>
-          <div class="item-sub">${sizeTxt ? esc(sizeTxt) + " · " : ""}${esc(shortDir)}</div>
+          <div class="item-sub">${esc(subParts.join(" · "))}</div>
         </div>
       </div>
       <div class="open-with-wrap">
@@ -357,7 +389,7 @@
         const hay = ((f.name || "") + " " + (f.path || "") + " " + (f.categoryLabel || "")).toLowerCase();
         if (!hay.includes(state.search)) return false;
       } else if (state.category === "all") {
-        if (!f.isReadable) return false;
+        if (state.tab !== "sent" && !f.isReadable) return false;
       } else {
         if ((f.category || "other") !== state.category) return false;
       }
@@ -365,12 +397,18 @@
     });
 
     const readableSessionCount = (state.sessionFiles || []).filter((f) => f.isReadable).length;
+    const sentCount = (state.sentFiles || []).length;
     const readableRecentCount = (state.recentFiles || []).filter((f) => f.isReadable).length;
     el("countSession").textContent = String(readableSessionCount || (state.sessionFiles || []).length);
+    el("countSent").textContent = String(sentCount);
     el("countRecent").textContent = String(readableRecentCount || (state.recentFiles || []).length);
 
     if (!filtered.length) {
-      container.innerHTML = `<div class="empty-box">该分类下暂无文件</div>`;
+      if (state.tab === "sent") {
+        container.innerHTML = `<div class="empty-box">暂无您发送的文件（您在聊天中发送或上传的图片、文档会单独隔离保存在此分类）</div>`;
+      } else {
+        container.innerHTML = `<div class="empty-box">该分类下暂无文件</div>`;
+      }
       return;
     }
 
@@ -432,6 +470,7 @@
       if (!data.ok) return;
 
       state.sessionFiles = data.sessionFiles || [];
+      state.sentFiles = data.sentFiles || [];
       state.recentFiles = data.recentFiles || [];
 
       if (!manual && state.sessionFiles.length === 0 && state.recentFiles.length > 0 && state.tab === "session") {

@@ -415,6 +415,183 @@ def resolve_active_conversation(requested_conv):
     return (app_dirs[0] if app_dirs else Path.home() / ".gemini" / "antigravity"), (requested_conv or "")
 
 
+def extract_paths_from_user_step(step, ai_created_lower_set):
+    """Extract ONLY files explicitly sent/attached by the human user in a USER_INPUT step."""
+    paths = []
+    if not isinstance(step, dict):
+        return paths
+
+    # 1. Media attachments explicitly uploaded by the user in this message
+    for m in step.get("media") or []:
+        if not isinstance(m, dict):
+            continue
+        uri = m.get("uri") or m.get("path") or ""
+        if uri:
+            lp = file_uri_to_local_path(uri) if uri.lower().startswith("file://") else os.path.normpath(uri)
+            if lp and os.path.isfile(lp) and lp.lower() not in ai_created_lower_set:
+                paths.append(lp)
+
+    # 2. Extract only from <USER_REQUEST>...</USER_REQUEST> (strip <CONTEXT_SUMMARY> & <SYSTEM_MESSAGE>)
+    content = step.get("content")
+    if isinstance(content, str) and content:
+        # Also capture explicit [Attachment: ... (path)] lines if present
+        for m in re.finditer(r"\[Attachment:[^\]]*\(([A-Za-z]:[\\/][^\r\n()\"'<>]+)\)\]", content):
+            cand = os.path.normpath(m.group(1).strip())
+            if os.path.isfile(cand) and cand.lower() not in ai_created_lower_set:
+                paths.append(cand)
+
+        # Strip system summary blocks so AI artifacts in summaries are NEVER mistaken for user-sent files
+        cleaned = re.sub(r"<CONTEXT_SUMMARY>[\s\S]*?</CONTEXT_SUMMARY>", "", content, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<SYSTEM_MESSAGE>[\s\S]*?</SYSTEM_MESSAGE>", "", cleaned, flags=re.IGNORECASE)
+        user_reqs = re.findall(r"<USER_REQUEST>([\s\S]*?)</USER_REQUEST>", cleaned, flags=re.IGNORECASE)
+        user_text = "\n".join(user_reqs) if user_reqs else cleaned
+
+        for m in re.finditer(r"file:///[^\s)\"'\]>`]+", user_text, flags=re.IGNORECASE):
+            lp = file_uri_to_local_path(m.group(0))
+            if lp and os.path.isfile(lp) and lp.lower() not in ai_created_lower_set:
+                paths.append(lp)
+
+        for m in re.finditer(r"(?:^|[\s@\"'])([A-Za-z]:[\\/][^\s\"'<>|?*]+\.[A-Za-z0-9]{1,8})", user_text):
+            cand = os.path.normpath(m.group(1).strip())
+            if os.path.isfile(cand) and cand.lower() not in ai_created_lower_set:
+                paths.append(cand)
+
+    return paths
+
+
+def collect_ai_created_paths(conv_folder):
+    """Return lowercase path set of files created/written by AI in this conversation."""
+    ai_set = set()
+    t_path = conv_folder / ".system_generated" / "logs" / "transcript.jsonl"
+    if not t_path.exists():
+        return ai_set
+    try:
+        for line in t_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.strip():
+                continue
+            try:
+                step = json.loads(line)
+            except Exception:
+                continue
+            for tc in step.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                if tc.get("name") in ("write_file", "edit_file"):
+                    args = tc.get("args") or {}
+                    if isinstance(args, dict):
+                        p = unquote_arg(args.get("Path") or args.get("AbsolutePath") or args.get("TargetFile") or "")
+                        if p:
+                            ai_set.add(os.path.normpath(p).lower())
+    except Exception:
+        pass
+    return ai_set
+
+
+def collect_user_sent_files(app_data, active_conv_id, max_items=60):
+    """Collect ONLY files sent/uploaded by the user, 100% isolated from AI deliverables."""
+    if not app_data:
+        return []
+    brain_dir = Path(app_data) / "brain"
+    if not brain_dir.exists():
+        return []
+
+    sent_map = {}
+
+    def add_sent(raw_p, is_current_conv, step_idx=0):
+        info = describe_file(raw_p, action_kind="user_sent", step_index=step_idx)
+        if not info or info.get("isDir"):
+            return
+        lower = info["path"].lower()
+        if (
+            ".system_generated" in lower
+            or "\\builtin\\skills\\" in lower
+            or "\\builtin\\plugins\\" in lower
+            or ("\\brain\\" in lower and "\\scratch\\" in lower)
+            or "\\browser_evidence\\" in lower
+            or "\\browser_sandbox\\" in lower
+        ):
+            return
+        info["isUserSent"] = True
+        info["isReadable"] = True
+        info["sentScope"] = "current" if is_current_conv else "history"
+        info["sentScopeLabel"] = "当前会话发送" if is_current_conv else "历史会话发送"
+
+        prev = sent_map.get(lower)
+        if not prev:
+            sent_map[lower] = info
+        else:
+            if is_current_conv and prev.get("sentScope") != "current":
+                prev["sentScope"] = "current"
+                prev["sentScopeLabel"] = "当前会话发送"
+            if step_idx > prev.get("stepIndex", -1):
+                prev["stepIndex"] = step_idx
+
+    def scan_conv_for_sent(conv_folder, is_current):
+        ai_created = collect_ai_created_paths(conv_folder)
+
+        # A. Scan .user_uploaded folder (100% user-uploaded attachments in Antigravity)
+        up_dir = conv_folder / ".user_uploaded"
+        if up_dir.exists() and up_dir.is_dir():
+            try:
+                for entry in os.scandir(up_dir):
+                    if entry.is_file():
+                        add_sent(entry.path, is_current, 10000 if is_current else 5000)
+            except Exception:
+                pass
+
+        # B. Scan USER_INPUT steps in transcript.jsonl
+        t_path = conv_folder / ".system_generated" / "logs" / "transcript.jsonl"
+        if t_path.exists():
+            try:
+                for line in t_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        step = json.loads(line)
+                    except Exception:
+                        continue
+                    stype = step.get("type") or ""
+                    ssource = step.get("source") or ""
+                    if stype == "USER_INPUT" or ssource == "USER_EXPLICIT":
+                        idx = int(step.get("step_index") or 0)
+                        for p in extract_paths_from_user_step(step, ai_created):
+                            add_sent(p, is_current, idx)
+            except Exception:
+                pass
+
+    # 1. Scan active conversation first
+    if active_conv_id and ID_RE.match(active_conv_id):
+        active_folder = brain_dir / active_conv_id
+        if active_folder.exists():
+            scan_conv_for_sent(active_folder, True)
+
+    # 2. Scan recent conversations for user-sent files
+    try:
+        conv_entries = []
+        for entry in os.scandir(brain_dir):
+            if entry.is_dir() and ID_RE.match(entry.name) and entry.name != active_conv_id:
+                try:
+                    conv_entries.append((entry.stat().st_mtime, Path(entry.path)))
+                except Exception:
+                    pass
+        conv_entries.sort(key=lambda x: x[0], reverse=True)
+        for _, cpath in conv_entries[:15]:
+            scan_conv_for_sent(cpath, False)
+    except Exception:
+        pass
+
+    result = list(sent_map.values())
+    result.sort(
+        key=lambda x: (
+            1 if x.get("sentScope") == "current" else 0,
+            x.get("mtimeMs", 0),
+            x.get("stepIndex", 0),
+        ),
+        reverse=True,
+    )
+    return result[:max_items]
+
+
 def collect_session_files(app_data, conv_id):
     if not app_data or not conv_id or not ID_RE.match(conv_id):
         return []
@@ -430,6 +607,7 @@ def collect_session_files(app_data, conv_id):
             or "\\builtin\\skills\\" in lower
             or "\\builtin\\plugins\\" in lower
             or ("\\brain\\" in lower and "\\scratch\\" in lower)
+            or "\\.user_uploaded\\" in lower
         ):
             return
         prev = items.get(lower)
@@ -980,13 +1158,21 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             app_data, conv_id = resolve_active_conversation(req_conv)
             cfg = load_user_config()
             apps = detect_installed_apps(cfg.get("customApps"))
-            session_files = collect_session_files(app_data, conv_id)
-            recent_files = collect_recent_project_files(cfg.get("watchedDirs"), 80)
+            sent_files = collect_user_sent_files(app_data, conv_id, 60)
+            sent_lower_set = {f["path"].lower() for f in sent_files}
+            session_files = [
+                f for f in collect_session_files(app_data, conv_id)
+                if f["path"].lower() not in sent_lower_set and "\\.user_uploaded\\" not in f["path"].lower()
+            ]
+            recent_files = [
+                f for f in collect_recent_project_files(cfg.get("watchedDirs"), 80)
+                if f["path"].lower() not in sent_lower_set and "\\.user_uploaded\\" not in f["path"].lower()
+            ]
             pinned_files = [
                 info for p in cfg.get("pinnedFiles", [])
                 if (info := describe_file(p, action_kind="pinned")) is not None
             ]
-            for flist in (session_files, recent_files, pinned_files):
+            for flist in (session_files, sent_files, recent_files, pinned_files):
                 for item in flist:
                     item["matchedApps"] = get_matched_apps_for_ext(item.get("ext", ""), apps)
             pending_doc = None
@@ -1000,6 +1186,7 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 "apps": apps,
                 "config": cfg,
                 "sessionFiles": session_files,
+                "sentFiles": sent_files,
                 "recentFiles": recent_files,
                 "pinnedFiles": pinned_files,
                 "pendingInternalOpen": pending_doc,

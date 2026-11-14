@@ -640,3 +640,33 @@ html, body {
 .hidden {
   display: none !important;
 }
+
+
+.cat-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--border-strong);
+  margin: 0 4px;
+  flex-shrink: 0;
+}
+
+.cat-pill.sent-isolated {
+  border: 1px dashed var(--border-strong);
+}
+
+.cat-pill.sent-isolated.active {
+  border-style: solid;
+  background: var(--bg-active);
+  color: var(--fg-primary);
+}
+
+.sent-tag {
+  display: inline-block;
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--bg-fill);
+  color: var(--fg-secondary);
+  border: 1px solid var(--border-subtle);
+  margin-right: 4px;
+}
