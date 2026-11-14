@@ -1,4 +1,41 @@
 (function () {
+  // ---------- Automatic Light/Dark Theme Sync with Antigravity ----------
+  // preload.js writes the host's tokens (--background, --foreground, etc.) onto :root.
+  // We compute luminance of --background to set data-theme="dark" or "light" automatically.
+  function syncScheme() {
+    try {
+      const probe = document.createElement("span");
+      probe.style.cssText = "position:absolute;visibility:hidden;pointer-events:none;color:var(--background, #f7f7f8)";
+      (document.body || document.documentElement).appendChild(probe);
+      const c = getComputedStyle(probe).color;
+      probe.remove();
+      const nums = (c.match(/[\d.]+/g) || []).map(Number);
+      if (nums.length < 3) return;
+      const scale = c.startsWith("color(") ? 1 : 255;
+      const r = nums[0] / scale;
+      const g = nums[1] / scale;
+      const b = nums[2] / scale;
+      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const theme = lum < 0.5 ? "dark" : "light";
+      if (document.documentElement.dataset.theme !== theme) {
+        document.documentElement.dataset.theme = theme;
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  syncScheme();
+  new MutationObserver(() => {
+    syncScheme();
+  }).observe(document.documentElement, { attributes: true, attributeFilter: ["style"] });
+
+  window.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "theme-change") {
+      setTimeout(syncScheme, 0);
+    }
+  });
+
   const NATIVE_FILEVIEW_EXTS = new Set([
     ".md", ".txt", ".json", ".py", ".js", ".mjs", ".ts", ".css", ".ps1",
     ".xml", ".yaml", ".yml", ".log", ".csv", ".html", ".htm",
@@ -94,14 +131,17 @@
     }
   }
 
-  // Open directly inside Antigravity!
-  // - Native readable formats (.md, .txt, images, code) -> window.sidecar.ui.toggleAuxPane({ tabType: 'fileView', uri })
-  // - Office formats (.docx, .pptx, .xlsx, .pdf) -> built-in Antigravity Doc View cleanly inside the pane (no "Preview is not available"!)
   async function openInsideAntigravity(f) {
     if (!f || !f.path) return;
     const ext = (f.ext || "").toLowerCase();
 
-    if (NATIVE_FILEVIEW_EXTS.has(ext) && window.sidecar && window.sidecar.ui && typeof window.sidecar.ui.toggleAuxPane === "function" && f.fileUri) {
+    if (
+      NATIVE_FILEVIEW_EXTS.has(ext) &&
+      window.sidecar &&
+      window.sidecar.ui &&
+      typeof window.sidecar.ui.toggleAuxPane === "function" &&
+      f.fileUri
+    ) {
       try {
         window.sidecar.ui.toggleAuxPane({ tabType: "fileView", uri: f.fileUri });
         showToast("已在 Antigravity 内打开");
@@ -111,14 +151,12 @@
       }
     }
 
-    // Fallback or Office (.docx / .pptx / .xlsx / .pdf): render inside Antigravity internal doc view
     state.activeInternalDoc = f;
     el("listViewWrap").classList.add("hidden");
     el("internalDocView").classList.remove("hidden");
     el("docTopTitle").textContent = f.name;
     el("docContent").innerHTML = '<div class="empty-box">正在加载文档内容...</div>';
 
-    // Populate header "打开方式" menu in internal doc view
     const docMenu = el("docMenuDrop");
     const matched = Array.isArray(f.matchedApps) ? f.matchedApps : [];
     const appBtns = matched
@@ -243,7 +281,7 @@
       .join("");
 
     const isMenuOpen = state.openMenuPath === f.path;
-    const shortDir = (f.dir || "").replace(/^D:\projects\?/i, "D:\projects\");
+    const shortDir = f.dir || "";
 
     item.innerHTML = `
       <div class="item-main" data-act="default-open" title="点击直接用默认程序打开">
@@ -338,7 +376,6 @@
 
     container.innerHTML = "";
 
-    // Group by file type when viewing "all" and grouping is enabled
     if (state.category === "all" && state.groupByType) {
       const buckets = new Map();
       filtered.forEach((f) => {
@@ -409,6 +446,12 @@
     } catch (err) {
       console.error("Failed to fetch state:", err);
     }
+  }
+
+  if (window.sidecar && typeof window.sidecar.onWorkspaceChange === "function") {
+    window.sidecar.onWorkspaceChange(() => {
+      fetchState(false);
+    });
   }
 
   fetchState(false);
