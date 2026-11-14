@@ -596,6 +596,247 @@ def perform_file_action(target_path, mode="default", app_id="", custom_exe=""):
     return spawn_detached(["xdg-open", real], work_dir)
 
 
+
+import csv
+import html as html_mod
+import mimetypes
+import xml.etree.ElementTree as ET
+import zipfile
+
+
+def preview_docx_to_html(real_path):
+    """Extract paragraphs and tables from a .docx file into clean high-contrast HTML."""
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    parts = []
+    with zipfile.ZipFile(real_path, "r") as zf:
+        if "word/document.xml" not in zf.namelist():
+            return "<p>无法在压缩包中找到 word/document.xml</p>"
+        xml_bytes = zf.read("word/document.xml")
+    root = ET.fromstring(xml_bytes)
+    body = root.find("w:body", ns)
+    if body is None:
+        return "<p>文档内容为空</p>"
+
+    for child in body:
+        tag = child.tag.split("}")[-1]
+        if tag == "p":
+            texts = []
+            is_bold = False
+            max_sz = 0
+            pPr = child.find("w:pPr", ns)
+            style_val = ""
+            if pPr is not None:
+                pStyle = pPr.find("w:pStyle", ns)
+                if pStyle is not None:
+                    style_val = pStyle.attrib.get(f"{{{ns['w']}}}val", "")
+            for r in child.findall(".//w:r", ns):
+                rPr = r.find("w:rPr", ns)
+                if rPr is not None:
+                    if rPr.find("w:b", ns) is not None:
+                        is_bold = True
+                    sz_el = rPr.find("w:sz", ns)
+                    if sz_el is not None:
+                        try:
+                            sz_v = int(sz_el.attrib.get(f"{{{ns['w']}}}val", "0"))
+                            if sz_v > max_sz:
+                                max_sz = sz_v
+                        except Exception:
+                            pass
+                for t in r.findall(".//w:t", ns):
+                    if t.text:
+                        texts.append(t.text)
+            line = "".join(texts).strip()
+            if not line:
+                continue
+            esc = html_mod.escape(line)
+            if "Heading1" in style_val or "Title" in style_val or max_sz >= 32:
+                parts.append(f'<h2 class="doc-h1">{esc}</h2>')
+            elif "Heading2" in style_val or max_sz >= 26:
+                parts.append(f'<h3 class="doc-h2">{esc}</h3>')
+            elif is_bold:
+                parts.append(f'<p class="doc-p"><strong>{esc}</strong></p>')
+            else:
+                parts.append(f'<p class="doc-p">{esc}</p>')
+        elif tag == "tbl":
+            rows_html = []
+            for idx, tr in enumerate(child.findall(".//w:tr", ns)):
+                cells_html = []
+                for tc in tr.findall("./w:tc", ns):
+                    cell_texts = [t.text for t in tc.findall(".//w:t", ns) if t.text]
+                    cell_str = html_mod.escape("".join(cell_texts).strip())
+                    cell_tag = "th" if idx == 0 else "td"
+                    cells_html.append(f"<{cell_tag}>{cell_str}</{cell_tag}>")
+                if cells_html:
+                    rows_html.append("<tr>" + "".join(cells_html) + "</tr>")
+            if rows_html:
+                parts.append('<table class="doc-table">' + "".join(rows_html) + "</table>")
+
+    if not parts:
+        return "<p>该 Word 文档暂无可提取的文字段落。</p>"
+    return "\n".join(parts)
+
+
+def preview_pptx_to_html(real_path):
+    """Extract slide text from .pptx into slide cards."""
+    parts = []
+    with zipfile.ZipFile(real_path, "r") as zf:
+        slide_names = sorted(
+            [n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml")],
+            key=lambda x: int(re.sub(r"\D", "", x) or "0")
+        )
+        for idx, sname in enumerate(slide_names, 1):
+            root = ET.fromstring(zf.read(sname))
+            paras = []
+            for p in root.iter():
+                if p.tag.endswith("}p"):
+                    runs = [t.text for t in p.iter() if t.tag.endswith("}t") and t.text]
+                    line = "".join(runs).strip()
+                    if line:
+                        paras.append(html_mod.escape(line))
+            body_html = "".join(f'<p class="doc-p">{line}</p>' for line in paras) or '<p class="doc-p">（本页仅包含图片或图形）</p>'
+            parts.append(f'<div class="slide-card"><div class="slide-badge">第 {idx} 页幻灯片</div>{body_html}</div>')
+    return "\n".join(parts) if parts else "<p>未能从 PPT 中提取到文字内容。</p>"
+
+
+def preview_xlsx_to_html(real_path):
+    """Extract first worksheet cells from .xlsx into an HTML table."""
+    with zipfile.ZipFile(real_path, "r") as zf:
+        shared = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            sroot = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in sroot.iter():
+                if si.tag.endswith("}si"):
+                    txt = "".join(t.text for t in si.iter() if t.tag.endswith("}t") and t.text)
+                    shared.append(txt)
+        sheets = sorted([n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")])
+        if not sheets:
+            return "<p>未找到工作表内容。</p>"
+        wroot = ET.fromstring(zf.read(sheets[0]))
+        rows_html = []
+        for r_idx, row in enumerate(wroot.iter()):
+            if not row.tag.endswith("}row"):
+                continue
+            if len(rows_html) >= 60:
+                break
+            cells = []
+            for c in row:
+                if not c.tag.endswith("}c"):
+                    continue
+                ctype = c.attrib.get("t", "")
+                val = ""
+                for v in c:
+                    if v.tag.endswith("}v") and v.text:
+                        val = v.text
+                    elif v.tag.endswith("}is"):
+                        val = "".join(t.text for t in v.iter() if t.tag.endswith("}t") and t.text)
+                if ctype == "s":
+                    try:
+                        val = shared[int(val)]
+                    except Exception:
+                        pass
+                tag = "th" if len(rows_html) == 0 else "td"
+                cells.append(f"<{tag}>{html_mod.escape(str(val))}</{tag}>")
+            if cells:
+                rows_html.append("<tr>" + "".join(cells) + "</tr>")
+        return '<table class="doc-table">' + "".join(rows_html) + "</table>" if rows_html else "<p>表格为空。</p>"
+
+
+def preview_markdown_to_html(text):
+    """Simple, clean Markdown-to-HTML renderer for beginners."""
+    lines = text.splitlines()
+    out = []
+    in_code = False
+    for raw in lines:
+        line = raw.rstrip()
+        if line.strip().startswith("```"):
+            if not in_code:
+                out.append('<pre class="doc-code"><code>')
+                in_code = True
+            else:
+                out.append("</code></pre>")
+                in_code = False
+            continue
+        if in_code:
+            out.append(html_mod.escape(line))
+            continue
+        if not line.strip():
+            continue
+        esc = html_mod.escape(line)
+        esc = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", esc)
+        esc = re.sub(r"`([^`]+)`", r'<code class="inline-code">\1</code>', esc)
+        if esc.startswith("# "):
+            out.append(f'<h2 class="doc-h1">{esc[2:]}</h2>')
+        elif esc.startswith("## "):
+            out.append(f'<h3 class="doc-h2">{esc[3:]}</h3>')
+        elif esc.startswith("### "):
+            out.append(f'<h4 class="doc-h3">{esc[4:]}</h4>')
+        elif esc.startswith("- ") or esc.startswith("* "):
+            out.append(f'<div class="doc-li">• {esc[2:]}</div>')
+        elif esc.startswith("&gt; "):
+            out.append(f'<div class="doc-quote">{esc[5:]}</div>')
+        else:
+            out.append(f'<p class="doc-p">{esc}</p>')
+    if in_code:
+        out.append("</code></pre>")
+    return "\n".join(out) or "<p>文档内容为空。</p>"
+
+
+def generate_file_preview(target_path):
+    if not target_path:
+        return {"ok": False, "error": "未提供文件路径"}
+    real = os.path.normpath(target_path)
+    if not os.path.exists(real):
+        return {"ok": False, "error": f"找不到文件：{real}"}
+    if os.path.isdir(real):
+        try:
+            items = sorted(os.listdir(real))[:100]
+            li = "".join(f'<div class="doc-li">📁 {html_mod.escape(x)}</div>' for x in items)
+            return {"ok": True, "kind": "html", "title": os.path.basename(real), "html": f'<h3 class="doc-h2">文件夹内容（共 {len(items)} 项）</h3>{li}'}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    ext = os.path.splitext(real)[1].lower()
+    name = os.path.basename(real)
+    try:
+        if ext == ".docx":
+            return {"ok": True, "kind": "html", "title": name, "badge": "Word 文档内置阅读", "html": preview_docx_to_html(real)}
+        if ext == ".pptx":
+            return {"ok": True, "kind": "html", "title": name, "badge": "PPT 幻灯片内置阅读", "html": preview_pptx_to_html(real)}
+        if ext == ".xlsx":
+            return {"ok": True, "kind": "html", "title": name, "badge": "Excel 表格内置阅读", "html": preview_xlsx_to_html(real)}
+        if ext == ".csv":
+            raw_text = Path(real).read_text(encoding="utf-8", errors="replace")
+            reader = list(csv.reader(raw_text.splitlines()[:60]))
+            rows = []
+            for idx, r in enumerate(reader):
+                tag = "th" if idx == 0 else "td"
+                rows.append("<tr>" + "".join(f"<{tag}>{html_mod.escape(c)}</{tag}>" for c in r) + "</tr>")
+            return {"ok": True, "kind": "html", "title": name, "badge": "CSV 表格内置阅读", "html": '<table class="doc-table">' + "".join(rows) + "</table>"}
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"):
+            return {"ok": True, "kind": "image", "title": name, "badge": "图片内置预览", "rawUrl": f"/api/raw?path={html_mod.escape(real)}"}
+        if ext == ".md":
+            raw_text = Path(real).read_text(encoding="utf-8", errors="replace")
+            return {"ok": True, "kind": "html", "title": name, "badge": "Markdown 内置阅读", "html": preview_markdown_to_html(raw_text)}
+        if ext in (".txt", ".json", ".py", ".js", ".mjs", ".ts", ".ps1", ".html", ".htm", ".css", ".xml", ".yaml", ".yml", ".log"):
+            raw_text = Path(real).read_text(encoding="utf-8", errors="replace")[:50000]
+            return {
+                "ok": True,
+                "kind": "html",
+                "title": name,
+                "badge": "文本/代码内置阅读",
+                "html": f'<pre class="doc-code"><code>{html_mod.escape(raw_text)}</code></pre>',
+            }
+        return {
+            "ok": True,
+            "kind": "unsupported",
+            "title": name,
+            "badge": "外部软件打开",
+            "html": f'<p class="doc-p">该格式（{html_mod.escape(ext or "未知")}）暂不支持在侧边栏直接解析文字，请点击上方<strong>「⚡ 用电脑软件打开」</strong>直接查看！</p>',
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"预览解析失败：{e}"}
+
+
 def run_agentapi(args):
     exe = os.environ.get("ANTIGRAVITY_AGENTAPI_EXE") or "agentapi"
     cmd = [exe, "agentapi"] + args if os.environ.get("ANTIGRAVITY_AGENTAPI_EXE") else ["agentapi"] + args
@@ -661,6 +902,20 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 "recentFiles": recent_files,
                 "pinnedFiles": pinned_files,
             })
+            return
+
+        if route == "/api/preview":
+            target_path = query.get("path") or ""
+            self._send_json(200, generate_file_preview(target_path))
+            return
+
+        if route == "/api/raw":
+            target_path = os.path.normpath(query.get("path") or "")
+            if os.path.isfile(target_path):
+                ctype, _ = mimetypes.guess_type(target_path)
+                self._send_bytes(200, ctype or "application/octet-stream", Path(target_path).read_bytes())
+                return
+            self._send_bytes(404, "text/plain; charset=utf-8", b"File not found")
             return
 
         if route == "/api/open":

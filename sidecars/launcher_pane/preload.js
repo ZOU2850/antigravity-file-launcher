@@ -76,10 +76,6 @@
     if (document.body) {
       document.body.style.margin = '0';
       document.body.style.padding = '0';
-      document.body.style.background = 'var(--background, #fafafa)';
-      document.body.style.color = 'var(--foreground, #333)';
-      document.body.style.fontFamily =
-        '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
     }
   };
 
