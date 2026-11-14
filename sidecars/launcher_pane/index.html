@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文件打开助手</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-top">
+      <div class="brand">
+        <span class="brand-icon" aria-hidden="true">📂</span>
+        <div>
+          <h1 class="brand-title">文件打开助手</h1>
+          <p class="brand-sub">点一下直接打开 · 自由切换打开方式</p>
+        </div>
+      </div>
+      <button id="btn-refresh" type="button" class="btn sm ghost" title="刷新文件列表">🔄 刷新</button>
+    </div>
+
+    <!-- Simple 2-Tab Switcher for Beginners -->
+    <nav class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="session" class="tab active">
+        ✨ 本次生成的文件 <span id="count-session" class="tab-badge">0</span>
+      </button>
+      <button type="button" role="tab" data-tab="recent" class="tab">
+        📁 全部项目成果 <span id="count-recent" class="tab-badge">0</span>
+      </button>
+    </nav>
+
+    <!-- Simple Type Filter Pills -->
+    <div class="filter-bar">
+      <button type="button" data-filter="all" class="chip active">全部文件</button>
+      <button type="button" data-filter="office" class="chip">📊 Word / PPT / PDF</button>
+      <button type="button" data-filter="doc" class="chip">📝 文本 / 网页</button>
+    </div>
+  </header>
+
+  <!-- File Cards List -->
+  <main id="file-list" class="file-list" role="list"></main>
+
+  <!-- Beginner-Friendly "Open With" Popover Menu -->
+  <div id="open-with-backdrop" class="backdrop hidden"></div>
+  <div id="open-with-menu" class="popover hidden" role="menu">
+    <div class="popover-header">
+      <div class="popover-title-row">
+        <span id="popover-filename" class="popover-title">你想用什么软件打开？</span>
+        <button id="btn-close-menu" type="button" class="close-btn" title="关闭">✕</button>
+      </div>
+      <label class="remember-row">
+        <input id="chk-remember-ext" type="checkbox">
+        <span>以后同类文件（<code id="popover-ext">.docx</code>）都默认用我选的软件打开</span>
+      </label>
+    </div>
+    <div id="popover-items" class="popover-items"></div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

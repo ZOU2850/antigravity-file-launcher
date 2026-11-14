@@ -1,0 +1,21 @@
+{
+  "command": "python",
+  "args": ["main.py"],
+  "restart_policy": "always",
+  "display_name": "File Launcher",
+  "description": "Click-to-open file results panel: open conversation output files with default app, choose 'Open With' program, or reveal in Explorer.",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": true
+  },
+  "ui_config": {
+    "display_name": "File Launcher",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "File Launcher"
+      }
+    ]
+  }
+}

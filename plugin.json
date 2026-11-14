@@ -1,0 +1,15 @@
+{
+  "name": "file-launcher",
+  "displayName": "File Launcher",
+  "version": "1.0.0",
+  "description": "Click-to-open file results panel for Antigravity: open generated files directly, choose 'Open With' apps (VS Code, Office/WPS, system Open With dialog), or reveal in File Explorer.",
+  "author": {
+    "name": "Antigravity Community"
+  },
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Open the File Launcher panel to view and launch files from this conversation",
+    "List all files generated in this session and open the latest result",
+    "Show recent output files in D:\\projects with Open With options"
+  ]
+}
