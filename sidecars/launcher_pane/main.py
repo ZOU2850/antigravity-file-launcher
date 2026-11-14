@@ -29,11 +29,12 @@ HERE = Path(__file__).resolve().parent
 IS_WIN = platform.system().lower() == "windows"
 ID_RE = re.compile(r"^[0-9a-f-]{8,}$", re.IGNORECASE)
 
+# 默认只展示对普通用户可读的成品文档与媒体文件（不显示 .py, .css, .js, .json 等代码文件）
 DELIVERABLE_EXTS = {
-    ".pptx", ".ppt", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv",
-    ".html", ".htm", ".md", ".png", ".jpg", ".jpeg", ".webp", ".svg",
-    ".mp4", ".mp3", ".wav", ".zip", ".7z", ".tar", ".gz", ".json",
-    ".py", ".js", ".mjs", ".ts", ".ps1", ".exe", ".msi"
+    ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".csv", ".pdf",
+    ".md", ".txt", ".rtf",
+    ".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif",
+    ".mp4", ".mp3", ".wav", ".zip"
 }
 
 CATEGORY_MAP = {
@@ -851,11 +852,23 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.end_headers()
+
     def _send_bytes(self, status, content_type, body_bytes):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body_bytes)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
         self.end_headers()
         self.wfile.write(body_bytes)
 
@@ -1049,6 +1062,16 @@ def main():
             "sampleRecentFiles": [f["path"] for f in recent_files[:5]],
         }, ensure_ascii=False, indent=2))
         return
+
+    import threading
+    fixed_port = 18765
+    try:
+        bridge_server = ThreadingHTTPServer(("127.0.0.1", fixed_port), SidecarRequestHandler)
+        t = threading.Thread(target=bridge_server.serve_forever, daemon=True)
+        t.start()
+        print(f"[sidecar-bridge] listening on 127.0.0.1:{fixed_port}", flush=True)
+    except Exception as e:
+        print(f"[sidecar-bridge] port {fixed_port} skipped: {e}", flush=True)
 
     port = int(os.environ.get("ANTIGRAVITY_SIDECAR_WEB_PORT") or "0")
     server = ThreadingHTTPServer(("127.0.0.1", port), SidecarRequestHandler)
