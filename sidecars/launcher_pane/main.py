@@ -838,6 +838,46 @@ def generate_file_preview(target_path):
         return {"ok": False, "error": f"预览解析失败：{e}"}
 
 
+
+# 按文件后缀精准匹配可用的打开方式（绝不把不相关的软件一股脑塞进去）
+EXT_APP_MAP = {
+    ".docx": ["word", "wps"],
+    ".doc":  ["word", "wps"],
+    ".rtf":  ["word", "wps", "notepad"],
+    ".xlsx": ["excel", "wps"],
+    ".xls":  ["excel", "wps"],
+    ".csv":  ["excel", "wps", "notepad", "vscode"],
+    ".pptx": ["powerpoint", "wps"],
+    ".ppt":  ["powerpoint", "wps"],
+    ".md":   ["notepad", "vscode", "cursor", "antigravity", "word", "wps"],
+    ".txt":  ["notepad", "vscode", "cursor", "antigravity"],
+    ".pdf":  ["edge", "chrome", "wps"],
+    ".html": ["edge", "chrome", "vscode", "notepad"],
+    ".htm":  ["edge", "chrome", "vscode", "notepad"],
+    ".png":  ["edge", "chrome"],
+    ".jpg":  ["edge", "chrome"],
+    ".jpeg": ["edge", "chrome"],
+    ".webp": ["edge", "chrome"],
+    ".svg":  ["edge", "chrome", "vscode"],
+}
+
+
+def get_matched_apps_for_ext(ext, all_apps):
+    """Return only the installed desktop apps that genuinely support this file extension."""
+    ext = (ext or "").lower()
+    allowed_ids = EXT_APP_MAP.get(ext, ["notepad", "vscode", "antigravity"])
+    by_id = {a["id"]: a for a in (all_apps or [])}
+    matched = []
+    for aid in allowed_ids:
+        if aid in by_id:
+            matched.append({"id": aid, "name": by_id[aid]["name"]})
+    # Also include any user-added custom apps
+    for a in (all_apps or []):
+        if a.get("id") not in ("default", "open_with_dialog", "explorer", "powershell", "word", "excel", "powerpoint", "wps", "vscode", "cursor", "antigravity", "edge", "chrome", "notepad"):
+            matched.append({"id": a["id"], "name": a["name"]})
+    return matched
+
+
 def run_agentapi(args):
     exe = os.environ.get("ANTIGRAVITY_AGENTAPI_EXE") or "agentapi"
     cmd = [exe, "agentapi"] + args if os.environ.get("ANTIGRAVITY_AGENTAPI_EXE") else ["agentapi"] + args
@@ -905,6 +945,9 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 info for p in cfg.get("pinnedFiles", [])
                 if (info := describe_file(p, action_kind="pinned")) is not None
             ]
+            for flist in (session_files, recent_files, pinned_files):
+                for item in flist:
+                    item["matchedApps"] = get_matched_apps_for_ext(item.get("ext", ""), apps)
             self._send_json(200, {
                 "ok": True,
                 "conversationId": conv_id,

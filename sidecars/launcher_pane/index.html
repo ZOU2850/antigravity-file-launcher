@@ -1,95 +1,583 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>File Launcher</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <style>/* ==========================================================================
+   Codex Pure Style — Minimal, Professional, Zero Clutter
+   ========================================================================== */
+:root {
+  --bg-page: #0d0d0f;
+  --bg-row: #16161a;
+  --bg-row-hover: #1d1d22;
+  --bg-menu: #1c1c21;
+  --bg-menu-hover: #2a2a32;
+  --border-subtle: #26262c;
+  --border-strong: #363640;
+  --fg-main: #f4f4f6;
+  --fg-sub: #9ca3af;
+  --fg-muted: #6b7280;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0 !important;
+  padding: 0 !important;
+  width: 100%;
+  height: 100%;
+  background: var(--bg-page) !important;
+  color: var(--fg-main) !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", "PingFang SC", "Microsoft YaHei", sans-serif !important;
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+.codex-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg-page);
+}
+
+/* Header */
+.codex-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #121215;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+
+.seg-tabs {
+  display: inline-flex;
+  background: #09090b;
+  padding: 2px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+}
+
+.seg-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-sub);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.seg-tab.active {
+  background: #222228;
+  color: var(--fg-main);
+  font-weight: 600;
+}
+
+.seg-count {
+  font-size: 11px;
+  color: var(--fg-muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.filter-input {
+  width: 130px;
+  height: 26px;
+  padding: 0 8px;
+  background: #09090b;
+  border: 1px solid var(--border-subtle);
+  border-radius: 5px;
+  color: var(--fg-main);
+  font-size: 12px;
+  outline: none;
+}
+
+.filter-input:focus {
+  border-color: var(--border-strong);
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-row);
+  color: var(--fg-sub);
+  cursor: pointer;
+}
+
+.icon-btn:hover {
+  background: var(--bg-row-hover);
+  color: var(--fg-main);
+}
+
+/* File List */
+.codex-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.codex-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--bg-row);
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.codex-item:hover {
+  background: var(--bg-row-hover);
+  border-color: var(--border-strong);
+}
+
+/* Clickable File Main Area (Click to open directly) */
+.item-main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  flex: 1;
+  cursor: pointer;
+}
+
+.ext-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  text-transform: uppercase;
+  background: rgba(59, 130, 246, 0.14);
+  color: #60a5fa;
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  flex-shrink: 0;
+}
+
+.ext-pill.word { background: rgba(59, 130, 246, 0.14); color: #60a5fa; border-color: rgba(59, 130, 246, 0.28); }
+.ext-pill.md { background: rgba(168, 85, 247, 0.14); color: #c084fc; border-color: rgba(168, 85, 247, 0.28); }
+.ext-pill.ppt { background: rgba(245, 158, 11, 0.14); color: #fbbf24; border-color: rgba(245, 158, 11, 0.28); }
+.ext-pill.excel { background: rgba(16, 185, 129, 0.14); color: #34d399; border-color: rgba(16, 185, 129, 0.28); }
+.ext-pill.pdf { background: rgba(239, 68, 68, 0.14); color: #f87171; border-color: rgba(239, 68, 68, 0.28); }
+
+.item-text {
+  min-width: 0;
+  flex: 1;
+}
+
+.item-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.item-main:hover .item-name {
+  color: #ffffff;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.item-sub {
+  font-size: 11px;
+  color: var(--fg-muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Right Side: ONLY "打开方式 ▾" */
+.open-with-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.open-with-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  background: #222228;
+  color: var(--fg-main);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s;
+}
+
+.open-with-btn:hover {
+  background: #2c2c34;
+}
+
+.svg-caret {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Custom Dropdown Menu */
+.dropdown-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  min-width: 185px;
+  background: var(--bg-menu);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  padding: 4px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+  z-index: 99;
+}
+
+.menu-section-label {
+  padding: 4px 8px 2px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg-main);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+}
+
+.menu-item:hover {
+  background: var(--bg-menu-hover);
+  color: #ffffff;
+}
+
+.menu-divider {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--border-subtle);
+}
+
+.empty-box {
+  text-align: center;
+  padding: 36px 14px;
+  color: var(--fg-muted);
+  font-size: 12.5px;
+}
+
+.toast {
+  position: fixed;
+  bottom: 12px;
+  right: 12px;
+  background: #f4f4f6;
+  color: #0d0d0f;
+  padding: 5px 11px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  z-index: 200;
+}
+
+.hidden {
+  display: none !important;
+}
+</style>
   <script src="/preload.js"></script>
 </head>
 <body>
-  <div class="shell">
-    <!-- Top Header Toolbar -->
-    <header class="header">
-      <div class="nav-tabs">
-        <button class="nav-tab active" id="tabSession" data-tab="session">
-          <span>当前产出</span>
-          <span class="tab-count" id="countSession">0</span>
+  <div class="codex-shell">
+    <header class="codex-header">
+      <div class="seg-tabs">
+        <button class="seg-tab active" id="tabSession">
+          <span>当前文档</span>
+          <span class="seg-count" id="countSession">0</span>
         </button>
-        <button class="nav-tab" id="tabRecent" data-tab="recent">
-          <span>项目文件</span>
-          <span class="tab-count" id="countRecent">0</span>
-        </button>
-        <button class="nav-tab" id="tabReader" data-tab="reader">
-          <span>文档预览</span>
+        <button class="seg-tab" id="tabRecent">
+          <span>最近文档</span>
+          <span class="seg-count" id="countRecent">0</span>
         </button>
       </div>
-      <div class="header-tools">
-        <input type="text" id="searchInput" class="search-input" placeholder="筛选文件..." />
-        <button class="icon-btn" id="themeToggleBtn" title="切换深浅主题">
-          <svg viewBox="0 0 24 24" class="svg-icon"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-        </button>
-        <button class="icon-btn" id="refreshBtn" title="刷新列表">
-          <svg viewBox="0 0 24 24" class="svg-icon"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+      <div class="header-right">
+        <input type="text" id="searchInput" class="filter-input" placeholder="筛选文档..." />
+        <button class="icon-btn" id="refreshBtn" title="刷新">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
         </button>
       </div>
     </header>
-
-    <!-- File List View -->
-    <main class="list-container" id="fileListContainer">
-      <div class="empty-state">正在加载文件列表...</div>
+    <main class="codex-list" id="fileListContainer">
+      <div class="empty-box">正在加载...</div>
     </main>
-
-    <!-- Built-in Document Reader View (For .docx, .md, .pptx, .xlsx) -->
-    <section class="reader-container hidden" id="readerView">
-      <div class="reader-bar">
-        <div class="reader-bar-left">
-          <button class="btn btn-ghost" id="readerBackBtn">
-            <svg viewBox="0 0 24 24" class="svg-icon"><path d="m15 18-6-6 6-6"/></svg>
-            <span>返回</span>
-          </button>
-          <span class="ext-tag" id="readerBadge">DOCX</span>
-          <span class="reader-filename" id="readerTitle">未选择文档</span>
-        </div>
-        <div class="reader-bar-actions">
-          <div class="split-btn-group">
-            <button class="btn btn-primary split-main" id="readerOpenDefaultBtn">
-              <span>打开</span>
-              <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
-            </button>
-            <button class="btn btn-primary split-trigger" id="readerOpenWithBtn" title="选择打开方式">
-              <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="m6 9 6 6 6-6"/></svg>
-            </button>
-          </div>
-          <button class="btn btn-secondary" id="readerRevealBtn" title="在资源管理器中显示">
-            <svg viewBox="0 0 24 24" class="svg-icon"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
-            <span>定位</span>
-          </button>
-        </div>
-      </div>
-      <div class="reader-canvas" id="readerBody">
-        <div class="empty-state">在文件列表中点击任意文档或「预览」按钮，即可在此直接阅读内容。</div>
-      </div>
-    </section>
-
-    <!-- Open With Popover / Modal -->
-    <div class="modal-overlay hidden" id="openWithModal">
-      <div class="modal-dialog">
-        <div class="modal-head">
-          <span class="modal-head-title">选择打开方式</span>
-          <button class="icon-btn" id="closeModalBtn">✕</button>
-        </div>
-        <div class="modal-sub" id="modalFileName">filename.docx</div>
-        <div class="app-menu-list" id="appGrid"></div>
-        <label class="modal-foot-check">
-          <input type="checkbox" id="rememberExtCheck" />
-          <span>始终使用所选应用打开 <code id="modalExtText">.docx</code> 文件</span>
-        </label>
-      </div>
-    </div>
-
     <div class="toast hidden" id="toastMsg">已执行</div>
   </div>
-  <script src="/app.js"></script>
+  <script>(function () {
+  let state = {
+    tab: "session",
+    search: "",
+    sessionFiles: [],
+    recentFiles: [],
+    openMenuPath: null,
+  };
+
+  const el = (id) => document.getElementById(id);
+
+  function showToast(msg) {
+    const t = el("toastMsg");
+    if (!t) return;
+    t.textContent = msg;
+    t.classList.remove("hidden");
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(() => t.classList.add("hidden"), 1800);
+  }
+
+  function getConversationId() {
+    if (window.antigravity && window.antigravity.conversationId) {
+      return window.antigravity.conversationId;
+    }
+    const params = new URLSearchParams(window.location.search);
+    return params.get("conversationId") || "";
+  }
+
+  function pillClass(ext) {
+    if (ext === ".docx" || ext === ".doc") return "ext-pill word";
+    if (ext === ".pptx" || ext === ".ppt") return "ext-pill ppt";
+    if (ext === ".xlsx" || ext === ".xls" || ext === ".csv") return "ext-pill excel";
+    if (ext === ".md") return "ext-pill md";
+    if (ext === ".pdf") return "ext-pill pdf";
+    return "ext-pill";
+  }
+
+  function esc(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  async function triggerOpen(filePath, mode, appId) {
+    try {
+      const q = new URLSearchParams({
+        path: filePath,
+        mode: mode || "default",
+        appId: appId || "",
+      });
+      const res = await fetch("/api/open?" + q.toString());
+      const data = await res.json();
+      if (data.ok) {
+        if (mode === "reveal") showToast("已在文件资源管理器中定位");
+        else if (mode === "open_with_dialog") showToast("已调出系统选择打开方式窗口");
+        else showToast("已打开文件");
+      } else {
+        showToast("无法打开: " + (data.error || "未知错误"));
+      }
+    } catch (err) {
+      showToast("请求失败: " + err.message);
+    }
+  }
+
+  // Close open dropdown when clicking outside
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".open-with-wrap")) {
+      state.openMenuPath = null;
+      document.querySelectorAll(".dropdown-menu").forEach((m) => m.classList.add("hidden"));
+    }
+  });
+
+  el("tabSession").addEventListener("click", () => {
+    state.tab = "session";
+    el("tabSession").classList.add("active");
+    el("tabRecent").classList.remove("active");
+    renderList();
+  });
+
+  el("tabRecent").addEventListener("click", () => {
+    state.tab = "recent";
+    el("tabRecent").classList.add("active");
+    el("tabSession").classList.remove("active");
+    renderList();
+  });
+
+  el("searchInput").addEventListener("input", (e) => {
+    state.search = (e.target.value || "").trim().toLowerCase();
+    renderList();
+  });
+
+  el("refreshBtn").addEventListener("click", () => {
+    fetchState(true);
+    showToast("已刷新");
+  });
+
+  function renderList() {
+    const container = el("fileListContainer");
+    const raw = state.tab === "recent" ? state.recentFiles : state.sessionFiles;
+    const list = raw.filter((f) => {
+      if (!state.search) return true;
+      return ((f.name || "") + " " + (f.path || "")).toLowerCase().includes(state.search);
+    });
+
+    el("countSession").textContent = String((state.sessionFiles || []).length);
+    el("countRecent").textContent = String((state.recentFiles || []).length);
+
+    if (!list.length) {
+      container.innerHTML = `<div class="empty-box">暂无可读文档</div>`;
+      return;
+    }
+
+    container.innerHTML = "";
+    list.forEach((f) => {
+      const item = document.createElement("div");
+      item.className = "codex-item";
+      const extLabel = (f.ext || "FILE").replace(".", "").toUpperCase();
+      const matched = Array.isArray(f.matchedApps) ? f.matchedApps : [];
+
+      const appButtonsHtml = matched
+        .map(
+          (a) =>
+            `<button class="menu-item" data-mode="app" data-app="${esc(a.id)}"><span>${esc(a.name)}</span></button>`
+        )
+        .join("");
+
+      const isMenuOpen = state.openMenuPath === f.path;
+
+      item.innerHTML = `
+        <div class="item-main" data-act="default-open" title="点击直接打开 ${esc(f.name)}">
+          <span class="${pillClass(f.ext)}">${esc(extLabel)}</span>
+          <div class="item-text">
+            <div class="item-name">${esc(f.name)}</div>
+            <div class="item-sub">${esc(f.sizeText || "")} · ${esc(f.dir || "")}</div>
+          </div>
+        </div>
+        <div class="open-with-wrap">
+          <button class="open-with-btn" data-act="toggle-menu">
+            <span>打开方式</span>
+            <svg viewBox="0 0 24 24" class="svg-caret"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+          <div class="dropdown-menu ${isMenuOpen ? "" : "hidden"}">
+            ${
+              matched.length
+                ? `<div class="menu-section-label">匹配的应用</div>${appButtonsHtml}<div class="menu-divider"></div>`
+                : ""
+            }
+            <button class="menu-item" data-mode="reveal">
+              <span>文件资源管理器</span>
+            </button>
+            <button class="menu-item" data-mode="open_with_dialog">
+              <span>选择打开方式...</span>
+            </button>
+          </div>
+        </div>
+      `;
+
+      // Click left file area -> open directly with default app
+      item.querySelector('[data-act="default-open"]').addEventListener("click", () => {
+        triggerOpen(f.path, "default", "");
+      });
+
+      // Click "打开方式 ▾" -> toggle smart dropdown menu
+      const menuEl = item.querySelector(".dropdown-menu");
+      item.querySelector('[data-act="toggle-menu"]').addEventListener("click", (e) => {
+        e.stopPropagation();
+        const willOpen = menuEl.classList.contains("hidden");
+        document.querySelectorAll(".dropdown-menu").forEach((m) => m.classList.add("hidden"));
+        if (willOpen) {
+          menuEl.classList.remove("hidden");
+          state.openMenuPath = f.path;
+        } else {
+          state.openMenuPath = null;
+        }
+      });
+
+      // Menu item clicks
+      menuEl.querySelectorAll(".menu-item").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          menuEl.classList.add("hidden");
+          state.openMenuPath = null;
+          const mode = btn.getAttribute("data-mode");
+          const appId = btn.getAttribute("data-app") || "";
+          triggerOpen(f.path, mode, appId);
+        });
+      });
+
+      container.appendChild(item);
+    });
+  }
+
+  async function fetchState(manual) {
+    try {
+      const convId = getConversationId();
+      const res = await fetch("/api/state?conversationId=" + encodeURIComponent(convId));
+      const data = await res.json();
+      if (!data.ok) return;
+      state.sessionFiles = data.sessionFiles || [];
+      state.recentFiles = data.recentFiles || [];
+
+      if (!manual && state.sessionFiles.length === 0 && state.recentFiles.length > 0 && state.tab === "session") {
+        state.sessionFiles = state.recentFiles.slice(0, 15);
+      }
+      renderList();
+    } catch (err) {
+      console.error("Failed to fetch state:", err);
+    }
+  }
+
+  fetchState(false);
+  setInterval(() => {
+    // Do not re-render while user has the dropdown menu open
+    if (!state.openMenuPath) fetchState(false);
+  }, 3500);
+})();
+</script>
 </body>
 </html>
