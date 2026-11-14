@@ -7,36 +7,18 @@
     apps: [],
     config: {},
     currentPreviewFile: null,
-    autoPreviewedOnce: false,
   };
 
   const el = (id) => document.getElementById(id);
 
-  // 初始化主题（默认深色高对比度）
   const savedTheme = localStorage.getItem("fl_theme") || "dark";
-  applyTheme(savedTheme);
-
-  function applyTheme(theme) {
-    document.documentElement.setAttribute("data-theme", theme);
-    localStorage.setItem("fl_theme", theme);
-    const btn = el("themeToggleBtn");
-    if (btn) {
-      btn.textContent = theme === "dark" ? "☀️ 换浅色" : "🌙 换深色";
-    }
-  }
+  document.documentElement.setAttribute("data-theme", savedTheme);
 
   el("themeToggleBtn").addEventListener("click", () => {
     const cur = document.documentElement.getAttribute("data-theme") || "dark";
-    applyTheme(cur === "dark" ? "light" : "dark");
-  });
-
-  // 常驻提示栏关闭记忆
-  if (localStorage.getItem("fl_hide_resident_banner") === "1") {
-    el("residentBanner").classList.add("hidden");
-  }
-  el("hideBannerBtn").addEventListener("click", () => {
-    el("residentBanner").classList.add("hidden");
-    localStorage.setItem("fl_hide_resident_banner", "1");
+    const next = cur === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    localStorage.setItem("fl_theme", next);
   });
 
   function showToast(msg) {
@@ -44,7 +26,7 @@
     t.textContent = msg;
     t.classList.remove("hidden");
     clearTimeout(showToast._timer);
-    showToast._timer = setTimeout(() => t.classList.add("hidden"), 2600);
+    showToast._timer = setTimeout(() => t.classList.add("hidden"), 2200);
   }
 
   function getConversationId() {
@@ -63,11 +45,9 @@
     });
 
     if (tabName === "reader") {
-      el("searchBarWrap").classList.add("hidden");
       el("fileListContainer").classList.add("hidden");
       el("readerView").classList.remove("hidden");
     } else {
-      el("searchBarWrap").classList.remove("hidden");
       el("fileListContainer").classList.remove("hidden");
       el("readerView").classList.add("hidden");
       renderFileList();
@@ -81,21 +61,21 @@
 
   el("searchInput").addEventListener("input", (e) => {
     state.search = (e.target.value || "").trim().toLowerCase();
-    renderFileList();
+    if (state.tab !== "reader") renderFileList();
   });
 
   el("refreshBtn").addEventListener("click", () => {
     fetchState(true);
-    showToast("🔄 已刷新文件列表");
+    showToast("已刷新");
   });
 
-  function badgeClass(ext) {
-    if (ext === ".docx" || ext === ".doc") return "ext-badge word";
-    if (ext === ".pptx" || ext === ".ppt") return "ext-badge ppt";
-    if (ext === ".xlsx" || ext === ".xls" || ext === ".csv") return "ext-badge excel";
-    if (ext === ".md") return "ext-badge md";
-    if (ext === ".pdf") return "ext-badge pdf";
-    return "ext-badge";
+  function tagClass(ext) {
+    if (ext === ".docx" || ext === ".doc") return "ext-tag word";
+    if (ext === ".pptx" || ext === ".ppt") return "ext-tag ppt";
+    if (ext === ".xlsx" || ext === ".xls" || ext === ".csv") return "ext-tag excel";
+    if (ext === ".md") return "ext-tag md";
+    if (ext === ".pdf") return "ext-tag pdf";
+    return "ext-tag";
   }
 
   function escapeHtml(s) {
@@ -109,47 +89,37 @@
   async function openInSideReader(fileObj) {
     if (!fileObj || !fileObj.path) return;
     state.currentPreviewFile = fileObj;
-    el("readerDot").style.display = "inline";
     switchTab("reader");
     el("readerTitle").textContent = fileObj.name || fileObj.path;
-    el("readerBadge").textContent = "正在加载预览...";
-    el("readerBody").innerHTML = '<div class="loading-box">正在为您解析文档内容...</div>';
+    el("readerBadge").textContent = (fileObj.ext || "FILE").replace(".", "").toUpperCase();
+    el("readerBadge").className = tagClass(fileObj.ext);
+    el("readerBody").innerHTML = '<div class="empty-state">正在解析文档内容...</div>';
 
     try {
       const res = await fetch("/api/preview?path=" + encodeURIComponent(fileObj.path));
       const data = await res.json();
       if (!data.ok) {
-        el("readerBadge").textContent = "读取提示";
-        el("readerBody").innerHTML = `<div class="empty-box"><div class="empty-title">无法直接预览</div><div class="empty-desc">${escapeHtml(data.error)}</div></div>`;
+        el("readerBody").innerHTML = `<div class="empty-state">${escapeHtml(data.error)}</div>`;
         return;
       }
-      el("readerBadge").textContent = data.badge || "内置阅读";
-      el("readerTitle").textContent = data.title || fileObj.name;
       if (data.kind === "image") {
-        el("readerBody").innerHTML = `<div style="text-align:center;"><img src="${data.rawUrl}" style="max-width:100%;border-radius:8px;border:2px solid #475569;" /></div>`;
+        el("readerBody").innerHTML = `<div style="text-align:center;"><img src="${data.rawUrl}" style="max-width:100%;border-radius:6px;border:1px solid var(--border-default);" /></div>`;
       } else {
-        el("readerBody").innerHTML = data.html || "<p>暂无内容</p>";
+        el("readerBody").innerHTML = data.html || '<div class="empty-state">暂无内容</div>';
       }
     } catch (err) {
-      el("readerBody").innerHTML = `<div class="empty-box"><div class="empty-title">预览加载失败</div><div class="empty-desc">${escapeHtml(err.message)}</div></div>`;
+      el("readerBody").innerHTML = `<div class="empty-state">预览加载失败: ${escapeHtml(err.message)}</div>`;
     }
   }
 
-  // 阅读器顶部的快捷打开按钮
   el("readerOpenDefaultBtn").addEventListener("click", () => {
-    if (state.currentPreviewFile) {
-      openFile(state.currentPreviewFile.path, "default");
-    }
+    if (state.currentPreviewFile) openFile(state.currentPreviewFile.path, "default");
   });
   el("readerOpenWithBtn").addEventListener("click", () => {
-    if (state.currentPreviewFile) {
-      showOpenWithModal(state.currentPreviewFile);
-    }
+    if (state.currentPreviewFile) showOpenWithModal(state.currentPreviewFile);
   });
   el("readerRevealBtn").addEventListener("click", () => {
-    if (state.currentPreviewFile) {
-      openFile(state.currentPreviewFile.path, "reveal");
-    }
+    if (state.currentPreviewFile) openFile(state.currentPreviewFile.path, "reveal");
   });
 
   async function openFile(filePath, mode, appId, rememberExt) {
@@ -163,18 +133,12 @@
       const res = await fetch("/api/open?" + q.toString());
       const data = await res.json();
       if (data.ok) {
-        if (mode === "reveal") {
-          showToast("📂 已在文件夹中为您高亮选中该文件！");
-        } else if (mode === "open_with_dialog") {
-          showToast("🪟 已呼出 Windows 系统「打开方式」窗口！");
-        } else {
-          showToast("⚡ 已为您启动电脑软件打开文件！");
-        }
+        showToast(mode === "reveal" ? "已在文件夹中定位" : "已打开文件");
       } else {
-        showToast("⚠️ 打开失败：" + (data.error || "未知错误"));
+        showToast("打开失败: " + (data.error || "未知错误"));
       }
     } catch (err) {
-      showToast("⚠️ 请求异常：" + err.message);
+      showToast("请求失败: " + err.message);
     }
   }
 
@@ -187,58 +151,38 @@
     const grid = el("appGrid");
     grid.innerHTML = "";
 
-    // 第一项：内置侧边栏直接看
-    const previewBtn = document.createElement("button");
-    previewBtn.className = "app-option-btn";
-    previewBtn.innerHTML = `<span>👁️</span><span>在右侧面板直接看（内置阅读器）</span>`;
-    previewBtn.addEventListener("click", () => {
-      modal.classList.add("hidden");
-      openInSideReader(fileObj);
-    });
-    grid.appendChild(previewBtn);
-
-    // 第二项：系统默认软件
-    const defBtn = document.createElement("button");
-    defBtn.className = "app-option-btn";
-    defBtn.innerHTML = `<span>⚡</span><span>系统默认软件直接打开</span>`;
-    defBtn.addEventListener("click", () => {
-      modal.classList.add("hidden");
-      openFile(fileObj.path, "default", "default", el("rememberExtCheck").checked);
-    });
-    grid.appendChild(defBtn);
-
-    // 检测到的本机软件列表
-    (state.apps || []).forEach((app) => {
+    const addOption = (label, subLabel, onClick) => {
       const btn = document.createElement("button");
-      btn.className = "app-option-btn";
-      btn.innerHTML = `<span>${escapeHtml(app.icon || "🖥️")}</span><span>用 <strong>${escapeHtml(app.name)}</strong> 打开</span>`;
+      btn.className = "app-item-btn";
+      btn.innerHTML = `<span>${escapeHtml(label)}</span><span style="font-size:11px;color:var(--fg-secondary);">${escapeHtml(subLabel || "")}</span>`;
       btn.addEventListener("click", () => {
         modal.classList.add("hidden");
-        openFile(fileObj.path, "app", app.id, el("rememberExtCheck").checked);
+        onClick();
       });
       grid.appendChild(btn);
+    };
+
+    addOption("系统默认应用", "Default", () => {
+      openFile(fileObj.path, "default", "default", el("rememberExtCheck").checked);
     });
 
-    // 最后一项：Windows 原生「打开方式...」弹窗
-    const sysDialogBtn = document.createElement("button");
-    sysDialogBtn.className = "app-option-btn";
-    sysDialogBtn.innerHTML = `<span>🪟</span><span>呼出 Windows 系统「打开方式...」弹窗</span>`;
-    sysDialogBtn.addEventListener("click", () => {
-      modal.classList.add("hidden");
+    (state.apps || []).forEach((app) => {
+      if (app.id === "default" || app.id === "open_with_dialog" || app.id === "explorer") return;
+      addOption(app.name, "桌面应用", () => {
+        openFile(fileObj.path, "app", app.id, el("rememberExtCheck").checked);
+      });
+    });
+
+    addOption("系统「打开方式...」对话框", "Windows", () => {
       openFile(fileObj.path, "open_with_dialog");
     });
-    grid.appendChild(sysDialogBtn);
 
     modal.classList.remove("hidden");
   }
 
-  el("closeModalBtn").addEventListener("click", () => {
-    el("openWithModal").classList.add("hidden");
-  });
+  el("closeModalBtn").addEventListener("click", () => el("openWithModal").classList.add("hidden"));
   el("openWithModal").addEventListener("click", (e) => {
-    if (e.target === el("openWithModal")) {
-      el("openWithModal").classList.add("hidden");
-    }
+    if (e.target === el("openWithModal")) el("openWithModal").classList.add("hidden");
   });
 
   function renderFileList() {
@@ -246,7 +190,7 @@
     const rawList = state.tab === "recent" ? state.recentFiles : state.sessionFiles;
     const filtered = rawList.filter((f) => {
       if (!state.search) return true;
-      const hay = ((f.name || "") + " " + (f.path || "") + " " + (f.badge || "")).toLowerCase();
+      const hay = ((f.name || "") + " " + (f.path || "")).toLowerCase();
       return hay.includes(state.search);
     });
 
@@ -254,47 +198,49 @@
     el("countRecent").textContent = String((state.recentFiles || []).length);
 
     if (!filtered.length) {
-      container.innerHTML = `
-        <div class="empty-box">
-          <div class="empty-icon">📭</div>
-          <div class="empty-title">暂未发现匹配的文件</div>
-          <div class="empty-desc">您可以切换到「🕒 最近项目文件」查看 D:\projects 下的所有文档，或者让 AI 生成一个新文件试试！</div>
-        </div>
-      `;
+      container.innerHTML = `<div class="empty-state">暂无匹配的可读文档</div>`;
       return;
     }
 
     container.innerHTML = "";
     filtered.forEach((fileObj) => {
-      const card = document.createElement("div");
-      card.className = "file-card";
-      card.innerHTML = `
-        <div class="card-top">
-          <div class="file-icon">${escapeHtml(fileObj.icon || "📄")}</div>
-          <div class="file-meta">
-            <div class="file-title-row">
-              <span class="${badgeClass(fileObj.ext)}">${escapeHtml(fileObj.badge || "文件")}</span>
-              <span class="file-name" title="点击在右侧直接预览内容">${escapeHtml(fileObj.name)}</span>
-            </div>
-            <div class="file-path">${escapeHtml(fileObj.sizeText || "")} · ${escapeHtml(fileObj.path)}</div>
+      const row = document.createElement("div");
+      row.className = "file-row";
+      const extLabel = (fileObj.ext || "FILE").replace(".", "").toUpperCase();
+
+      row.innerHTML = `
+        <div class="file-info" data-act="preview" title="点击预览文档内容">
+          <span class="${tagClass(fileObj.ext)}">${escapeHtml(extLabel)}</span>
+          <div class="file-text">
+            <div class="file-title">${escapeHtml(fileObj.name)}</div>
+            <div class="file-meta-sub">${escapeHtml(fileObj.sizeText || "")} · ${escapeHtml(fileObj.dir || "")}</div>
           </div>
         </div>
-        <div class="card-actions">
-          <button class="act-btn act-preview" data-act="preview">👁️ 在侧边直接看</button>
-          <button class="act-btn act-primary" data-act="open">⚡ 用电脑软件打开</button>
-          <button class="act-btn act-indigo" data-act="openwith">🔄 换个软件打开 ▾</button>
-          <button class="act-btn act-folder" data-act="reveal">📂 打开所在文件夹</button>
+        <div class="row-actions">
+          <button class="btn btn-secondary" data-act="preview">预览</button>
+          <div class="split-btn-group">
+            <button class="btn btn-primary split-main" data-act="open" title="使用默认应用打开">
+              <span>打开</span>
+              <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
+            </button>
+            <button class="btn btn-primary split-trigger" data-act="openwith" title="选择打开应用">
+              <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+          </div>
+          <button class="icon-btn" data-act="reveal" title="在文件夹中显示">
+            <svg viewBox="0 0 24 24" class="svg-icon"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+          </button>
         </div>
       `;
 
-      // 点击文件名或「在侧边直接看」都在内置阅读器里打开（解决内置侧边打不开 Word 的问题）
-      card.querySelector(".file-name").addEventListener("click", () => openInSideReader(fileObj));
-      card.querySelector('[data-act="preview"]').addEventListener("click", () => openInSideReader(fileObj));
-      card.querySelector('[data-act="open"]').addEventListener("click", () => openFile(fileObj.path, "default"));
-      card.querySelector('[data-act="openwith"]').addEventListener("click", () => showOpenWithModal(fileObj));
-      card.querySelector('[data-act="reveal"]').addEventListener("click", () => openFile(fileObj.path, "reveal"));
+      row.querySelectorAll('[data-act="preview"]').forEach((n) =>
+        n.addEventListener("click", () => openInSideReader(fileObj))
+      );
+      row.querySelector('[data-act="open"]').addEventListener("click", () => openFile(fileObj.path, "default"));
+      row.querySelector('[data-act="openwith"]').addEventListener("click", () => showOpenWithModal(fileObj));
+      row.querySelector('[data-act="reveal"]').addEventListener("click", () => openFile(fileObj.path, "reveal"));
 
-      container.appendChild(card);
+      container.appendChild(row);
     });
   }
 
@@ -316,9 +262,8 @@
         el("countRecent").textContent = String(state.recentFiles.length);
       }
 
-      // 如果本次对话没有关联文件但最近项目文件有，自动展示最近项目文件避免空白
       if (!manual && state.sessionFiles.length === 0 && state.recentFiles.length > 0 && state.tab === "session") {
-        state.sessionFiles = state.recentFiles.slice(0, 12);
+        state.sessionFiles = state.recentFiles.slice(0, 15);
         renderFileList();
       }
     } catch (err) {

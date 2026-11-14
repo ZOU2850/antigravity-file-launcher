@@ -3,105 +3,92 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>文件助手 (File Launcher)</title>
+  <title>File Launcher</title>
   <link rel="stylesheet" href="/styles.css" />
   <script src="/preload.js"></script>
 </head>
 <body>
-  <div class="app-shell">
-    <!-- 顶部导航栏 -->
-    <header class="topbar">
-      <div class="brand">
-        <span class="brand-icon">📂</span>
-        <div>
-          <div class="brand-title">文件打开助手</div>
-          <div class="brand-sub">支持侧边直接看 Word/MD + 一键选软件打开</div>
-        </div>
+  <div class="shell">
+    <!-- Top Header Toolbar -->
+    <header class="header">
+      <div class="nav-tabs">
+        <button class="nav-tab active" id="tabSession" data-tab="session">
+          <span>当前产出</span>
+          <span class="tab-count" id="countSession">0</span>
+        </button>
+        <button class="nav-tab" id="tabRecent" data-tab="recent">
+          <span>项目文件</span>
+          <span class="tab-count" id="countRecent">0</span>
+        </button>
+        <button class="nav-tab" id="tabReader" data-tab="reader">
+          <span>文档预览</span>
+        </button>
       </div>
-      <div class="topbar-actions">
-        <button id="themeToggleBtn" class="top-btn" title="切换深色/浅色高对比度显示">☀️ 浅色</button>
-        <button id="refreshBtn" class="top-btn" title="刷新文件列表">🔄 刷新</button>
+      <div class="header-tools">
+        <input type="text" id="searchInput" class="search-input" placeholder="筛选文件..." />
+        <button class="icon-btn" id="themeToggleBtn" title="切换深浅主题">
+          <svg viewBox="0 0 24 24" class="svg-icon"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+        </button>
+        <button class="icon-btn" id="refreshBtn" title="刷新列表">
+          <svg viewBox="0 0 24 24" class="svg-icon"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+        </button>
       </div>
     </header>
 
-    <!-- 右上角常驻秘诀提示栏 -->
-    <div class="resident-banner" id="residentBanner">
-      <div class="resident-text">
-        📌 <strong>右上角常驻小窍门：</strong>只要<strong>不点上方标签页的 ×</strong>，本助手就会一直在右上角常驻！平时点右上角侧边栏图标即可随时收起或展开。
-      </div>
-      <button id="hideBannerBtn" class="banner-close" title="知道了">知道了</button>
-    </div>
-
-    <!-- 主视图切换栏（文件列表 vs 侧边阅读器） -->
-    <div class="tabs-bar">
-      <button class="tab-btn active" data-tab="session" id="tabSession">
-        ✨ 本次生成的文件 <span class="badge-count" id="countSession">0</span>
-      </button>
-      <button class="tab-btn" data-tab="recent" id="tabRecent">
-        🕒 最近项目文件 <span class="badge-count" id="countRecent">0</span>
-      </button>
-      <button class="tab-btn" data-tab="reader" id="tabReader">
-        📖 侧边直接看 <span class="reader-dot" id="readerDot" style="display:none;">●</span>
-      </button>
-    </div>
-
-    <!-- 搜索框（仅在列表模式显示） -->
-    <div class="search-bar" id="searchBarWrap">
-      <input
-        type="text"
-        id="searchInput"
-        class="search-input"
-        placeholder="🔍 输入文件名搜索（例如：word、测试、.docx、.md）..."
-      />
-    </div>
-
-    <!-- 视图 1 & 2：文件卡片列表 -->
-    <main class="file-list" id="fileListContainer">
-      <div class="loading-box">正在扫描文件，请稍候...</div>
+    <!-- File List View -->
+    <main class="list-container" id="fileListContainer">
+      <div class="empty-state">正在加载文件列表...</div>
     </main>
 
-    <!-- 视图 3：内置侧边阅读器（直接看 Word / Markdown / PPT / Excel / 代码 / 图片） -->
-    <section class="reader-view hidden" id="readerView">
-      <div class="reader-toolbar">
-        <button class="btn-back" id="readerBackBtn">⬅️ 返回列表</button>
-        <div class="reader-file-info">
-          <span class="reader-badge" id="readerBadge">内置阅读</span>
-          <span class="reader-title" id="readerTitle">未选择文件</span>
+    <!-- Built-in Document Reader View (For .docx, .md, .pptx, .xlsx) -->
+    <section class="reader-container hidden" id="readerView">
+      <div class="reader-bar">
+        <div class="reader-bar-left">
+          <button class="btn btn-ghost" id="readerBackBtn">
+            <svg viewBox="0 0 24 24" class="svg-icon"><path d="m15 18-6-6 6-6"/></svg>
+            <span>返回</span>
+          </button>
+          <span class="ext-tag" id="readerBadge">DOCX</span>
+          <span class="reader-filename" id="readerTitle">未选择文档</span>
+        </div>
+        <div class="reader-bar-actions">
+          <div class="split-btn-group">
+            <button class="btn btn-primary split-main" id="readerOpenDefaultBtn">
+              <span>打开</span>
+              <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
+            </button>
+            <button class="btn btn-primary split-trigger" id="readerOpenWithBtn" title="选择打开方式">
+              <svg viewBox="0 0 24 24" class="svg-icon-sm"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+          </div>
+          <button class="btn btn-secondary" id="readerRevealBtn" title="在资源管理器中显示">
+            <svg viewBox="0 0 24 24" class="svg-icon"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+            <span>定位</span>
+          </button>
         </div>
       </div>
-      <div class="reader-quick-open" id="readerQuickActions">
-        <button class="act-btn act-primary" id="readerOpenDefaultBtn">⚡ 用电脑软件打开 (Word/WPS等)</button>
-        <button class="act-btn act-indigo" id="readerOpenWithBtn">🔄 换个软件打开 ▾</button>
-        <button class="act-btn act-folder" id="readerRevealBtn">📂 所在文件夹</button>
-      </div>
-      <div class="reader-body" id="readerBody">
-        <div class="empty-box">
-          <div class="empty-icon">📖</div>
-          <div class="empty-title">还没有选择要预览的文件</div>
-          <div class="empty-desc">在「本次生成的文件」里点击任意文件的 <strong>「👁️ 侧边直接看」</strong>，即可在这里直接阅读 Word、Markdown、PPT 或表格内容！</div>
-        </div>
+      <div class="reader-canvas" id="readerBody">
+        <div class="empty-state">在文件列表中点击任意文档或「预览」按钮，即可在此直接阅读内容。</div>
       </div>
     </section>
 
-    <!-- 换个软件打开 弹窗菜单 -->
-    <div class="modal-backdrop hidden" id="openWithModal">
-      <div class="modal-card">
-        <div class="modal-header">
-          <div class="modal-title">🔄 选择打开方式</div>
-          <button class="modal-close" id="closeModalBtn">✕</button>
+    <!-- Open With Popover / Modal -->
+    <div class="modal-overlay hidden" id="openWithModal">
+      <div class="modal-dialog">
+        <div class="modal-head">
+          <span class="modal-head-title">选择打开方式</span>
+          <button class="icon-btn" id="closeModalBtn">✕</button>
         </div>
-        <div class="modal-filename" id="modalFileName">文件名.docx</div>
-        <div class="modal-desc">点击下方任意软件即可打开该文件：</div>
-        <div class="app-grid" id="appGrid"></div>
-        <label class="remember-row">
+        <div class="modal-sub" id="modalFileName">filename.docx</div>
+        <div class="app-menu-list" id="appGrid"></div>
+        <label class="modal-foot-check">
           <input type="checkbox" id="rememberExtCheck" />
-          <span>以后同类文件（<strong id="modalExtText">.docx</strong>）默认都用我选的软件打开</span>
+          <span>始终使用所选应用打开 <code id="modalExtText">.docx</code> 文件</span>
         </label>
       </div>
     </div>
 
-    <!-- 底部状态提示条 -->
-    <div class="toast hidden" id="toastMsg">操作成功</div>
+    <div class="toast hidden" id="toastMsg">已执行</div>
   </div>
   <script src="/app.js"></script>
 </body>
