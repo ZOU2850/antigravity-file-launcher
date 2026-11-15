@@ -76,7 +76,7 @@ antigravity-file-launcher/
 #### 方式 A：PowerShell 一键安装（推荐）
 1. 通过 GitHub Desktop 或 `git clone` 将本仓库克隆到本地：
    ```bash
-   git clone <你的仓库地址> antigravity-file-launcher
+   git clone https://github.com/ZOU2850/antigravity-file-launcher.git antigravity-file-launcher
    cd antigravity-file-launcher
    ```
 2. 执行安装脚本：
