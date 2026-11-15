@@ -10,6 +10,6 @@
   "suggestedPrompts": [
     "Open the File Launcher panel to view and launch files from this conversation",
     "List all files generated in this session and open the latest result",
-    "Show recent output files in D:\\projects with Open With options"
+    "Show recent workspace and session output files with Open With options"
   ]
 }

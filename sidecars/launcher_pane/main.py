@@ -18,8 +18,10 @@ import json
 import os
 import platform
 import re
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -71,6 +73,10 @@ SKIP_DIRS = {
     "node_modules", ".git", ".hg", ".svn", "__pycache__", ".venv", "venv",
     "dist", "build", ".next", ".nuxt", ".cache", ".agents", ".agent", ".gemini"
 }
+NON_PROJECT_SUBDIRS = SKIP_DIRS | {
+    "archived_docs", "pinned_protected_files", "fl_preview", ".fl_preview",
+    "file_launcher_preview", ".file_launcher_preview", "tmp", "temp",
+}
 
 ACTION_WEIGHT = {
     "created": 5,
@@ -109,14 +115,33 @@ def get_ipc_path():
     return base / "file_launcher_ipc.json"
 
 
+QUEUE_LOCK = threading.RLock()
+QUEUE_COND = threading.Condition(QUEUE_LOCK)
+ACTION_SEQ = 0
+
+
 def read_ipc_state():
     p = get_ipc_path()
+    default_ipc = {
+        "lastSidecarSeen": 0.0,
+        "lastSidecarVisible": 0.0,
+        "pendingInternalOpen": None,
+        "queue": [],
+        "ackedIds": {},
+        "chatAttachedByConv": {},
+    }
     if not p.exists():
-        return {"lastSidecarSeen": 0.0, "pendingInternalOpen": None}
+        return default_ipc
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return default_ipc
+        for k, v in default_ipc.items():
+            if k not in raw or raw[k] is None:
+                raw[k] = v
+        return raw
     except Exception:
-        return {"lastSidecarSeen": 0.0, "pendingInternalOpen": None}
+        return default_ipc
 
 
 def write_ipc_state(state_obj):
@@ -132,6 +157,12 @@ def get_config_path():
     base = dirs[0] if dirs else (Path.home() / ".gemini" / "antigravity")
     base.mkdir(parents=True, exist_ok=True)
     return base / "file_launcher_config.json"
+
+
+def get_data_base_dir():
+    if IS_WIN and Path("D:\\projects").exists():
+        return Path("D:\\projects")
+    return Path.home() / "Documents" / "AntigravityFileLauncher"
 
 
 def default_config():
@@ -151,10 +182,10 @@ import shutil as _shutil
 def sync_anti_compaction_manifest(pinned_paths, active_conv_id=""):
     """
     Persist a human- and AI-readable manifest of pinned (anti-compaction protected) files
-    both in D:\\projects\\Pinned_Protected_Files and in the active conversation brain directory,
+    both in <data_base>/Pinned_Protected_Files and in the active conversation brain directory,
     so context compaction NEVER loses track of starred files.
     """
-    prot_dir = Path("D:\\projects\\Pinned_Protected_Files") if IS_WIN else (Path.home() / "Pinned_Protected_Files")
+    prot_dir = get_data_base_dir() / "Pinned_Protected_Files"
     prot_dir.mkdir(parents=True, exist_ok=True)
 
     lines = [
@@ -237,7 +268,7 @@ def perform_batch_action(op, paths, conv_id=""):
         return {"ok": True, "op": op, "pinnedFiles": pins}
 
     if op == "archive":
-        arch_dir = Path("D:\\projects\\Archived_Docs") if IS_WIN else (Path.home() / "Archived_Docs")
+        arch_dir = get_data_base_dir() / "Archived_Docs"
         arch_dir.mkdir(parents=True, exist_ok=True)
         archived_out = []
         for p in norm_paths:
@@ -261,16 +292,16 @@ def perform_batch_action(op, paths, conv_id=""):
         save_user_config(cfg)
         return {"ok": True, "op": op, "archivedFiles": archived}
 
-    if op == "copy_chat_refs":
-        refs = [f"@{p}" for p in norm_paths]
-        clip_text = " ".join(refs) + " "
-        if IS_WIN:
-            try:
-                p_clip = subprocess.Popen(["clip.exe"], stdin=subprocess.PIPE)
-                p_clip.communicate(input=clip_text.encode("utf-16-le"))
-            except Exception:
-                pass
-        return {"ok": True, "op": op, "count": len(norm_paths), "chatText": clip_text, "refs": refs}
+    if op in ("attach", "copy_chat_refs"):
+        files = []
+        for p in norm_paths:
+            side = build_side_uri(p, conv_id)
+            if side.get("ok") and side.get("file"):
+                item = dict(side["file"])
+                item["openUri"] = side.get("uri") or item.get("fileUri") or ""
+                item["sideKind"] = side.get("kind") or "external"
+                files.append(item)
+        return {"ok": True, "op": "attach", "count": len(files), "files": files}
 
     return {"ok": False, "error": f"未知操作: {op}"}
 
@@ -573,6 +604,420 @@ def resolve_active_conversation(requested_conv):
     return (app_dirs[0] if app_dirs else Path.home() / ".gemini" / "antigravity"), (requested_conv or "")
 
 
+_CONV_PROJECT_CACHE = {}
+
+
+def parse_workspace_paths(raw_ws):
+    """Parse workspaceUris JSON array or pipe-separated paths into normalized directory paths."""
+    if not raw_ws:
+        return []
+    vals = []
+    if isinstance(raw_ws, str):
+        s = raw_ws.strip()
+        if s.startswith("["):
+            try:
+                vals = json.loads(s)
+            except Exception:
+                vals = []
+        else:
+            vals = [x for x in s.split("|") if x]
+    elif isinstance(raw_ws, list):
+        vals = raw_ws
+    out = []
+    seen = set()
+    for v in vals:
+        if not isinstance(v, str) or not v.strip():
+            continue
+        p = file_uri_to_local_path(v) if v.strip().lower().startswith("file://") else os.path.normpath(v.strip())
+        if p and os.path.exists(p):
+            try:
+                real = str(Path(p).resolve())
+            except Exception:
+                real = os.path.normpath(p)
+            low = real.lower()
+            if low not in seen:
+                seen.add(low)
+                out.append(real)
+    return out
+
+
+def discover_local_dir_roots(cfg):
+    """Discover subdirectories inside watchedDirs as local folders (NOT Antigravity Projects)."""
+    roots = []
+    seen = set()
+    for wd in (cfg.get("watchedDirs") or []):
+        if not wd or not os.path.exists(wd):
+            continue
+        try:
+            wd_real = str(Path(wd).resolve())
+        except Exception:
+            wd_real = os.path.normpath(wd)
+        try:
+            subs = []
+            for entry in os.scandir(wd_real):
+                if entry.is_dir() and not entry.name.startswith(".") and entry.name.lower() not in NON_PROJECT_SUBDIRS:
+                    subs.append((entry.stat().st_mtime, entry.path))
+            subs.sort(key=lambda x: x[0], reverse=True)
+            for _, sp in subs:
+                try:
+                    real = str(Path(sp).resolve())
+                except Exception:
+                    real = os.path.normpath(sp)
+                low = real.lower()
+                name = os.path.basename(real) or real
+                if low in seen or not os.path.isdir(real):
+                    continue
+                seen.add(low)
+                roots.append({
+                    "id": f"local:{low}",
+                    "name": name,
+                    "path": real,
+                    "kind": "local_dir",
+                    "isWorkspace": False,
+                })
+        except Exception:
+            pass
+    return roots
+
+
+def discover_project_roots(cfg, workspace_paths=None):
+    """Discover real Antigravity workspace roots cleanly; local watched subdirs use discover_local_dir_roots."""
+    roots = []
+    seen = set()
+    for wp in (workspace_paths or []):
+        try:
+            real = str(Path(wp).resolve())
+        except Exception:
+            real = os.path.normpath(wp)
+        low = real.lower()
+        name = os.path.basename(real) or real
+        if not os.path.isdir(real) or low in seen:
+            continue
+        seen.add(low)
+        roots.append({
+            "id": f"agproj:{low}",
+            "name": name,
+            "path": real,
+            "kind": "project",
+            "isWorkspace": True,
+        })
+    return roots
+
+
+def load_sidebar_db_data(app_data, active_conv_id="", active_workspace_paths=None):
+    """
+    Read Antigravity's conversation_summaries.db (read-only) to retrieve:
+    - conversations: top-level conversations matching the exact left sidebar order & titles
+    - realProjects: genuine Antigravity Projects / open workspace folders (empty when user created none)
+    - conv_meta_map: dict[conv_id] -> { title, agProjectId, agProjectName, wsPaths, isCurrent }
+    """
+    real_projects = []
+    proj_by_id = {}
+
+    def ensure_real_project(pid, name, path_str="", is_ws=False):
+        if not pid:
+            return None
+        existing = proj_by_id.get(pid)
+        if existing:
+            if is_ws:
+                existing["isWorkspace"] = True
+            return existing
+        entry = {
+            "id": pid,
+            "name": name,
+            "path": path_str,
+            "kind": "project",
+            "isWorkspace": bool(is_ws),
+        }
+        proj_by_id[pid] = entry
+        real_projects.append(entry)
+        return entry
+
+    # Any currently open Antigravity workspace folder counts as an active project
+    for wp in (active_workspace_paths or []):
+        try:
+            real = str(Path(wp).resolve())
+        except Exception:
+            real = os.path.normpath(wp)
+        if os.path.isdir(real):
+            ensure_real_project(f"agproj:{real.lower()}", os.path.basename(real) or real, real, is_ws=True)
+
+    conversations = []
+    conv_meta_map = {}
+
+    db_path = Path(app_data) / "conversation_summaries.db" if app_data else None
+    rows = []
+    if db_path and db_path.exists():
+        conn = None
+        try:
+            db_uri = db_path.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(db_uri, uri=True, timeout=1.5)
+            conn.row_factory = sqlite3.Row
+            rows = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT conversation_id, title, project_id, workspace_uris, parent_conversation_id, last_modified_time "
+                    "FROM conversation_summaries "
+                    "WHERE COALESCE(parent_conversation_id, '') = '' "
+                    "ORDER BY last_modified_time DESC"
+                ).fetchall()
+            ]
+        except Exception:
+            rows = []
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    seen_convs = set()
+    for r in rows:
+        cid = (r.get("conversation_id") or "").strip()
+        if not cid or not ID_RE.match(cid) or cid in seen_convs:
+            continue
+        seen_convs.add(cid)
+        raw_title = (r.get("title") or "").strip()
+        title = raw_title or (f"对话 {cid[:8]}")
+        raw_pid = (r.get("project_id") or "").strip()
+        ws_paths = parse_workspace_paths(r.get("workspace_uris") or "")
+
+        ag_proj_id = ""
+        ag_proj_name = ""
+        if ws_paths:
+            wp0 = ws_paths[0]
+            try:
+                wp0_real = str(Path(wp0).resolve())
+            except Exception:
+                wp0_real = os.path.normpath(wp0)
+            p_entry = ensure_real_project(
+                f"agproj:{wp0_real.lower()}",
+                os.path.basename(wp0_real) or wp0_real,
+                wp0_real,
+                is_ws=(cid == active_conv_id and bool(active_workspace_paths)),
+            )
+            if p_entry:
+                ag_proj_id = p_entry["id"]
+                ag_proj_name = p_entry["name"]
+        elif raw_pid and raw_pid.lower() != "outside-of-project":
+            pname = os.path.basename(raw_pid) if os.path.isdir(raw_pid) else raw_pid
+            p_entry = ensure_real_project(
+                f"agproj:{raw_pid}",
+                pname,
+                raw_pid if os.path.isdir(raw_pid) else "",
+                is_ws=False,
+            )
+            if p_entry:
+                ag_proj_id = p_entry["id"]
+                ag_proj_name = p_entry["name"]
+
+        is_cur = (cid == active_conv_id)
+        if is_cur and not ag_proj_id and real_projects:
+            ws_actives = [p for p in real_projects if p.get("isWorkspace")]
+            if ws_actives:
+                ag_proj_id = ws_actives[0]["id"]
+                ag_proj_name = ws_actives[0]["name"]
+
+        meta = {
+            "id": f"conv:{cid}",
+            "convId": cid,
+            "name": title,
+            "kind": "conversation",
+            "isCurrent": is_cur,
+            "agProjectId": ag_proj_id,
+            "agProjectName": ag_proj_name,
+            "lastModifiedTime": str(r.get("last_modified_time") or ""),
+        }
+        conversations.append(meta)
+        conv_meta_map[cid] = meta
+
+    # Ensure active conversation always exists even if DB hasn't indexed it yet
+    if active_conv_id and ID_RE.match(active_conv_id) and active_conv_id not in seen_convs:
+        ws_actives = [p for p in real_projects if p.get("isWorkspace")]
+        meta = {
+            "id": f"conv:{active_conv_id}",
+            "convId": active_conv_id,
+            "name": f"当前对话 {active_conv_id[:8]}",
+            "kind": "conversation",
+            "isCurrent": True,
+            "agProjectId": ws_actives[0]["id"] if ws_actives else "",
+            "agProjectName": ws_actives[0]["name"] if ws_actives else "",
+            "lastModifiedTime": "",
+        }
+        conversations.insert(0, meta)
+        conv_meta_map[active_conv_id] = meta
+
+    # Fallback if DB was completely unavailable: list recent brain folders
+    if not rows and app_data:
+        brain_dir = Path(app_data) / "brain"
+        if brain_dir.exists():
+            extra = []
+            try:
+                for entry in os.scandir(brain_dir):
+                    if entry.is_dir() and ID_RE.match(entry.name) and entry.name not in seen_convs:
+                        t_path = Path(entry.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                        mt = t_path.stat().st_mtime if t_path.exists() else entry.stat().st_mtime
+                        extra.append((mt, entry.name))
+            except Exception:
+                pass
+            extra.sort(key=lambda x: x[0], reverse=True)
+            for _, cid in extra[:20]:
+                seen_convs.add(cid)
+                meta = {
+                    "id": f"conv:{cid}",
+                    "convId": cid,
+                    "name": f"历史对话 {cid[:8]}",
+                    "kind": "conversation",
+                    "isCurrent": (cid == active_conv_id),
+                    "agProjectId": "",
+                    "agProjectName": "",
+                    "lastModifiedTime": "",
+                }
+                conversations.append(meta)
+                conv_meta_map[cid] = meta
+
+    return real_projects, conversations, conv_meta_map
+
+
+def match_path_to_project(file_path, roots):
+    """Longest-prefix match from a filesystem path to known project or local folder roots."""
+    if not file_path:
+        return None
+    low = os.path.normpath(file_path).lower()
+    best = None
+    best_len = -1
+    for root in (roots or []):
+        rp = (root.get("path") or "").lower().rstrip("\\/")
+        if not rp:
+            continue
+        if low == rp or low.startswith(rp + os.sep) or low.startswith(rp + "/"):
+            if len(rp) > best_len:
+                best = root
+                best_len = len(rp)
+    return best
+
+
+def infer_conv_project_map(app_data, project_roots, max_convs=24):
+    """Map conversation IDs to a real Antigravity workspace/project ONLY when present."""
+    res = {}
+    if not app_data or not project_roots:
+        return res
+    brain_dir = Path(app_data) / "brain"
+    if not brain_dir.exists():
+        return res
+    convs = []
+    try:
+        for entry in os.scandir(brain_dir):
+            if entry.is_dir() and ID_RE.match(entry.name):
+                t_path = Path(entry.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                try:
+                    mt = t_path.stat().st_mtime if t_path.exists() else entry.stat().st_mtime
+                    convs.append((mt, entry.name, t_path))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    convs.sort(key=lambda x: x[0], reverse=True)
+    roots_sig = tuple(r["id"] for r in project_roots)
+
+    for mt, cid, t_path in convs[:max_convs]:
+        cached = _CONV_PROJECT_CACHE.get(cid)
+        if cached and cached[0] == mt and cached[1] == roots_sig:
+            if cached[2]:
+                res[cid] = cached[2]
+            continue
+        counts = {}
+        if t_path.exists():
+            try:
+                raw = t_path.read_text(encoding="utf-8", errors="ignore")
+                raw_low = raw.lower()
+                for root in project_roots:
+                    rp_low = (root.get("path") or "").lower()
+                    if not rp_low:
+                        continue
+                    rp_slash = rp_low.replace("\\", "/")
+                    c = raw_low.count(rp_low) + (raw_low.count(rp_slash) if rp_slash != rp_low else 0)
+                    if c > 0:
+                        counts[root["id"]] = (c, root)
+            except Exception:
+                pass
+        best_root = max(counts.values(), key=lambda x: x[0])[1] if counts else None
+        _CONV_PROJECT_CACHE[cid] = (mt, roots_sig, best_root)
+        if best_root:
+            res[cid] = best_root
+    return res
+
+
+def tag_file_project(
+    item,
+    project_roots=None,
+    conv_project_map=None,
+    fallback_conv_id="",
+    active_conv_id="",
+    workspace_projects=None,
+    local_dir_roots=None,
+    conv_meta_map=None,
+):
+    """Attach strictly-separated convId/convTitle, agProjectId/agProjectName, and localDirId/localDirName metadata."""
+    if not isinstance(item, dict):
+        return item
+
+    cid = item.get("convId") or fallback_conv_id or ""
+    if not cid and item.get("path"):
+        m_brain = re.search(r"[\\/]brain[\\/]([0-9a-f-]{8,})[\\/]", item["path"], flags=re.IGNORECASE)
+        if m_brain:
+            cid = m_brain.group(1)
+
+    if cid:
+        item["convId"] = cid
+    cmeta = (conv_meta_map or {}).get(cid) if cid else None
+    if cmeta:
+        item["convTitle"] = cmeta.get("name") or item.get("convTitle") or ""
+
+    if active_conv_id:
+        item["isCurrentConv"] = (cid == active_conv_id) if cid else bool(item.get("isCurrentConv", False))
+
+    matched_ag = match_path_to_project(item.get("path"), project_roots)
+    matched_local = match_path_to_project(item.get("path"), local_dir_roots)
+
+    ag_id = ""
+    ag_name = ""
+    if matched_ag:
+        ag_id = matched_ag["id"]
+        ag_name = matched_ag["name"]
+    elif cmeta and cmeta.get("agProjectId"):
+        ag_id = cmeta["agProjectId"]
+        ag_name = cmeta.get("agProjectName") or ""
+    elif cid and cid == active_conv_id and workspace_projects:
+        ws0 = workspace_projects[0]
+        ag_id = ws0["id"]
+        ag_name = ws0["name"]
+    elif cid and conv_project_map and cid in conv_project_map:
+        inferred = conv_project_map[cid]
+        ag_id = inferred["id"]
+        ag_name = inferred["name"]
+
+    item["agProjectId"] = ag_id
+    item["agProjectName"] = ag_name
+    item["localDirId"] = matched_local["id"] if matched_local else ""
+    item["localDirName"] = matched_local["name"] if matched_local else ""
+
+    if ag_id:
+        item["projectId"] = ag_id
+        item["projectName"] = ag_name
+    elif cid:
+        item["projectId"] = f"conv:{cid}"
+        item["projectName"] = item.get("convTitle") or ("当前对话" if cid == active_conv_id else f"历史对话 {cid[:8]}")
+    elif matched_local:
+        item["projectId"] = matched_local["id"]
+        item["projectName"] = matched_local["name"]
+    else:
+        item["projectId"] = "scope:__standalone__"
+        item["projectName"] = "独立文档"
+
+    return item
+
+
 def extract_paths_from_user_step(step, ai_created_lower_set):
     """Extract ONLY files explicitly sent/attached by the human user in a USER_INPUT step."""
     paths = []
@@ -655,7 +1100,7 @@ def collect_user_sent_files(app_data, active_conv_id, max_items=60):
 
     sent_map = {}
 
-    def add_sent(raw_p, is_current_conv, step_idx=0):
+    def add_sent(raw_p, conv_folder_name, is_current_conv, step_idx=0):
         info = describe_file(raw_p, action_kind="user_sent", step_index=step_idx)
         if not info or info.get("isDir"):
             return
@@ -667,10 +1112,16 @@ def collect_user_sent_files(app_data, active_conv_id, max_items=60):
             or ("\\brain\\" in lower and "\\scratch\\" in lower)
             or "\\browser_evidence\\" in lower
             or "\\browser_sandbox\\" in lower
+            or "\\.fl_preview\\" in lower
+            or "\\fl_preview\\" in lower
+            or "\\file_launcher_preview\\" in lower
+            or "\\.file_launcher_preview\\" in lower
         ):
             return
         info["isUserSent"] = True
         info["isReadable"] = True
+        info["convId"] = conv_folder_name
+        info["isCurrentConv"] = bool(is_current_conv)
         info["sentScope"] = "current" if is_current_conv else "history"
         info["sentScopeLabel"] = "当前会话发送" if is_current_conv else "历史会话发送"
 
@@ -681,11 +1132,14 @@ def collect_user_sent_files(app_data, active_conv_id, max_items=60):
             if is_current_conv and prev.get("sentScope") != "current":
                 prev["sentScope"] = "current"
                 prev["sentScopeLabel"] = "当前会话发送"
+                prev["isCurrentConv"] = True
+                prev["convId"] = conv_folder_name
             if step_idx > prev.get("stepIndex", -1):
                 prev["stepIndex"] = step_idx
 
     def scan_conv_for_sent(conv_folder, is_current):
         ai_created = collect_ai_created_paths(conv_folder)
+        cid_name = conv_folder.name
 
         # A. Scan .user_uploaded folder (100% user-uploaded attachments in Antigravity)
         up_dir = conv_folder / ".user_uploaded"
@@ -693,7 +1147,7 @@ def collect_user_sent_files(app_data, active_conv_id, max_items=60):
             try:
                 for entry in os.scandir(up_dir):
                     if entry.is_file():
-                        add_sent(entry.path, is_current, 10000 if is_current else 5000)
+                        add_sent(entry.path, cid_name, is_current, 10000 if is_current else 5000)
             except Exception:
                 pass
 
@@ -713,7 +1167,7 @@ def collect_user_sent_files(app_data, active_conv_id, max_items=60):
                     if stype == "USER_INPUT" or ssource == "USER_EXPLICIT":
                         idx = int(step.get("step_index") or 0)
                         for p in extract_paths_from_user_step(step, ai_created):
-                            add_sent(p, is_current, idx)
+                            add_sent(p, cid_name, is_current, idx)
             except Exception:
                 pass
 
@@ -750,7 +1204,10 @@ def collect_user_sent_files(app_data, active_conv_id, max_items=60):
     return result[:max_items]
 
 
-def collect_session_files(app_data, conv_id):
+_CONV_SESSION_CACHE = {}
+
+
+def collect_session_files(app_data, conv_id, is_current=True):
     if not app_data or not conv_id or not ID_RE.match(conv_id):
         return []
     items = {}
@@ -766,10 +1223,16 @@ def collect_session_files(app_data, conv_id):
             or "\\builtin\\plugins\\" in lower
             or ("\\brain\\" in lower and "\\scratch\\" in lower)
             or "\\.user_uploaded\\" in lower
+            or "\\.fl_preview\\" in lower
+            or "\\fl_preview\\" in lower
+            or "\\file_launcher_preview\\" in lower
+            or "\\.file_launcher_preview\\" in lower
         ):
             return
         prev = items.get(lower)
         if not prev:
+            info["convId"] = conv_id
+            info["isCurrentConv"] = bool(is_current)
             items[lower] = info
             return
         if ACTION_WEIGHT.get(action_kind, 0) >= ACTION_WEIGHT.get(prev["actionKind"], 0):
@@ -784,7 +1247,7 @@ def collect_session_files(app_data, conv_id):
             return
         try:
             for entry in os.scandir(d):
-                if entry.name.startswith(".") or entry.name == "browser_sandbox":
+                if entry.name.startswith(".") or entry.name in ("browser_sandbox", "fl_preview"):
                     continue
                 if entry.is_dir():
                     scan_artifact_dir(Path(entry.path), depth + 1)
@@ -830,13 +1293,6 @@ def collect_session_files(app_data, conv_id):
         except Exception:
             pass
 
-    # Also include any files from D:\projects\file_launcher_test_demo so demo deliverables are always visible at top
-    demo_dir = Path(r"D:\projects\file_launcher_test_demo")
-    if demo_dir.exists():
-        for entry in os.scandir(demo_dir):
-            if entry.is_file():
-                upsert(entry.path, "created", 99999)
-
     result = list(items.values())
     result.sort(
         key=lambda x: (
@@ -850,38 +1306,110 @@ def collect_session_files(app_data, conv_id):
     return result
 
 
-def collect_recent_project_files(watched_dirs, max_items=50):
+def collect_all_session_files(app_data, conversations, active_conv_id, max_convs=25):
+    """Collect session deliverables per top-level conversation (with transcript mtime cache)."""
+    if not app_data:
+        return []
+    cids = []
+    seen_cid = set()
+    if active_conv_id and ID_RE.match(active_conv_id):
+        cids.append(active_conv_id)
+        seen_cid.add(active_conv_id)
+    for c in (conversations or []):
+        cid = c.get("convId") or ""
+        if cid and cid not in seen_cid:
+            cids.append(cid)
+            seen_cid.add(cid)
+
+    combined = []
+    for cid in cids[:max_convs]:
+        is_cur = (cid == active_conv_id)
+        conv_dir = Path(app_data) / "brain" / cid
+        if not conv_dir.exists():
+            continue
+        t_path = conv_dir / ".system_generated" / "logs" / "transcript.jsonl"
+        try:
+            sig = (conv_dir.stat().st_mtime, t_path.stat().st_mtime if t_path.exists() else 0.0)
+        except Exception:
+            sig = None
+        cached = _CONV_SESSION_CACHE.get(cid)
+        if not is_cur and cached and sig and cached[0] == sig:
+            rows = [dict(x) for x in cached[1]]
+        else:
+            rows = collect_session_files(app_data, cid, is_current=is_cur)
+            if sig:
+                _CONV_SESSION_CACHE[cid] = (sig, [dict(x) for x in rows])
+        for row in rows:
+            row["convId"] = cid
+            row["isCurrentConv"] = is_cur
+            combined.append(row)
+    return combined
+
+
+def collect_recent_project_files(watched_dirs, max_items=180, project_roots=None, per_project=30):
     found = []
     seen = set()
 
-    def walk(d, depth=0):
-        if depth > 3 or not os.path.exists(d):
-            return
-        try:
-            for entry in os.scandir(d):
-                if entry.name.startswith("."):
-                    continue
-                if entry.is_dir():
-                    if entry.name.lower() in SKIP_DIRS:
-                        continue
-                    walk(entry.path, depth + 1)
-                else:
-                    ext = os.path.splitext(entry.name)[1].lower()
-                    if ext not in DELIVERABLE_EXTS:
-                        continue
-                    lower = entry.path.lower()
-                    if lower in seen:
-                        continue
-                    seen.add(lower)
-                    info = describe_file(entry.path, action_kind="recent")
-                    if info:
-                        found.append(info)
-        except Exception:
-            pass
+    def scan_subtree(base_dir, max_count, max_depth=3):
+        bucket = []
 
+        def walk(d, depth=0):
+            if depth > max_depth or not os.path.exists(d):
+                return
+            try:
+                for entry in os.scandir(d):
+                    if entry.name.startswith("."):
+                        continue
+                    if entry.is_dir():
+                        if entry.name.lower() in NON_PROJECT_SUBDIRS:
+                            continue
+                        walk(entry.path, depth + 1)
+                    else:
+                        ext = os.path.splitext(entry.name)[1].lower()
+                        if ext not in DELIVERABLE_EXTS:
+                            continue
+                        lower = entry.path.lower()
+                        if lower in seen:
+                            continue
+                        seen.add(lower)
+                        info = describe_file(entry.path, action_kind="recent")
+                        if info:
+                            bucket.append(info)
+            except Exception:
+                pass
+
+        walk(base_dir, 0)
+        bucket.sort(key=lambda x: x["mtimeMs"], reverse=True)
+        return bucket[:max_count]
+
+    # Collect per-project first so large projects cannot crowd out other projects
+    if project_roots:
+        for pr in project_roots:
+            rp = pr.get("path")
+            if rp and os.path.exists(rp):
+                found.extend(scan_subtree(rp, per_project, max_depth=3))
+
+    # Also collect loose files sitting directly inside watched_dirs roots (depth 0)
     for root in watched_dirs or []:
         if root and os.path.exists(root):
-            walk(root, 0)
+            try:
+                loose = []
+                for entry in os.scandir(root):
+                    if entry.is_file() and not entry.name.startswith("."):
+                        ext = os.path.splitext(entry.name)[1].lower()
+                        if ext in DELIVERABLE_EXTS:
+                            lower = entry.path.lower()
+                            if lower not in seen:
+                                seen.add(lower)
+                                info = describe_file(entry.path, action_kind="recent")
+                                if info:
+                                    loose.append(info)
+                loose.sort(key=lambda x: x["mtimeMs"], reverse=True)
+                found.extend(loose[:per_project])
+            except Exception:
+                pass
+            if not project_roots:
+                found.extend(scan_subtree(root, max_items, max_depth=3))
 
     found.sort(key=lambda x: x["mtimeMs"], reverse=True)
     return found[:max_items]
@@ -1302,9 +1830,7 @@ def build_native_open_uri(info):
     ext = (info.get("ext") or "").lower()
     if ext in (".docx", ".pptx", ".xlsx"):
         try:
-            dirs = find_app_data_dirs()
-            base = dirs[0] if dirs else (Path.home() / ".gemini" / "antigravity")
-            cache_dir = base / "preview_cache"
+            cache_dir = get_data_base_dir() / "Pinned_Protected_Files"
             cache_dir.mkdir(parents=True, exist_ok=True)
             stem = os.path.splitext(os.path.basename(real))[0]
             out_md = cache_dir / f"{stem}.md"
@@ -1321,7 +1847,230 @@ def build_native_open_uri(info):
     return info.get("fileUri") or ""
 
 
+# 宿主右侧分栏 fileView 能直接渲染的格式（.pdf 默认交给浏览器/WPS 打开，避免纯文本 fileView 显示不可预览）
+SIDE_NATIVE_EXTS = {
+    ".md", ".txt", ".log", ".csv", ".json", ".xml", ".yaml", ".yml",
+    ".py", ".js", ".mjs", ".ts", ".css", ".ps1", ".html", ".htm",
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
+}
+SIDE_MIRROR_EXTS = {".docx", ".pptx", ".xlsx"}
+
+
+def _preview_dir_for(conv_id):
+    """Office 预览镜像放在当前会话 brain 目录的 fl_preview 子目录（宿主侧边栏一定可读，且不会混进文件列表）。"""
+    resolved_conv = conv_id
+    if not (resolved_conv and ID_RE.match(resolved_conv)):
+        _, resolved_conv = resolve_active_conversation("")
+    if resolved_conv and ID_RE.match(resolved_conv):
+        for ad in find_app_data_dirs():
+            conv_dir = Path(ad) / "brain" / resolved_conv
+            if conv_dir.exists():
+                d = conv_dir / "fl_preview"
+                d.mkdir(parents=True, exist_ok=True)
+                return d
+    d = get_data_base_dir() / "file_launcher_preview"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def build_side_uri(target_path, conv_id=""):
+    """返回 {ok, uri, kind}: kind = native(原文件直开) | mirror(Office 转 Markdown 只读镜像) | external(只能用电脑软件打开)"""
+    if target_path == "__AUTO_RELOAD_SIDECAR__":
+        return {
+            "ok": True,
+            "uri": "",
+            "kind": "reload",
+            "file": {"path": "__AUTO_RELOAD_SIDECAR__", "name": "正在更新插件界面...", "ext": ""},
+        }
+    info = describe_file(target_path, action_kind="linked")
+    if not info or info.get("isDir"):
+        return {"ok": False, "error": "文件不存在"}
+    ext = (info.get("ext") or "").lower()
+    if ext in SIDE_NATIVE_EXTS:
+        return {"ok": True, "uri": info["fileUri"], "kind": "native", "file": info}
+    if ext in SIDE_MIRROR_EXTS:
+        try:
+            real = info["path"]
+            if ext == ".docx":
+                body = docx_to_markdown(real)
+            elif ext == ".pptx":
+                body = pptx_to_markdown(real)
+            else:
+                body = xlsx_to_markdown(real)
+            out = _preview_dir_for(conv_id) / (os.path.splitext(os.path.basename(real))[0] + ".md")
+            header = f"> 📄 **{info['name']}** 的只读预览（原文件未改动）　·　原文件：`{real}`\n\n"
+            out.write_text(header + body, encoding="utf-8")
+            return {"ok": True, "uri": out.resolve().as_uri(), "kind": "mirror", "file": info}
+        except Exception as e:
+            return {"ok": True, "uri": "", "kind": "external", "file": info, "error": str(e)}
+    return {"ok": True, "uri": "", "kind": "external", "file": info}
+
+
+def push_ipc_action(action):
+    """把动作（open / attach）压入磁盘队列，并立即唤醒处于可见状态的长轮询 File Launcher 面板。"""
+    global ACTION_SEQ
+    with QUEUE_COND:
+        ipc = read_ipc_state()
+        now = time.time()
+        ACTION_SEQ += 1
+        aid = f"{int(now * 1000)}_{ACTION_SEQ}"
+        action = dict(action)
+        action["id"] = aid
+        action["ts"] = now
+        q = [a for a in (ipc.get("queue") or []) if now - float(a.get("ts") or 0) < 60.0]
+        q.append(action)
+        ipc["queue"] = q[-30:]
+        ipc["pendingInternalOpen"] = None
+        write_ipc_state(ipc)
+        vis_active = (now - float(ipc.get("lastSidecarVisible") or 0)) < 20.0
+        QUEUE_COND.notify_all()
+        return vis_active, aid
+
+
+def ack_ipc_actions(action_ids):
+    ids = [x.strip() for x in (action_ids or []) if x and x.strip()]
+    if not ids:
+        return
+    with QUEUE_COND:
+        ipc = read_ipc_state()
+        now = time.time()
+        acked = {k: v for k, v in (ipc.get("ackedIds") or {}).items() if now - float(v or 0) < 180.0}
+        for aid in ids:
+            acked[aid] = now
+        ipc["ackedIds"] = acked
+        write_ipc_state(ipc)
+
+
+def _conv_bucket_key(conv_id):
+    return conv_id if (conv_id and ID_RE.match(conv_id)) else "__global__"
+
+
+def get_chat_attached(conv_id):
+    ipc = read_ipc_state()
+    by_conv = ipc.get("chatAttachedByConv") or {}
+    key = _conv_bucket_key(conv_id)
+    items = list(by_conv.get(key) or [])
+    if key != "__global__" and by_conv.get("__global__"):
+        # Merge any pre-conversation global attaches cleanly if path still exists
+        seen = {str(x.get("path") or "").lower() for x in items}
+        for gi in by_conv["__global__"]:
+            p = str(gi.get("path") or "")
+            if p and p.lower() not in seen:
+                items.append(gi)
+                seen.add(p.lower())
+    out = []
+    for item in items:
+        p = item.get("path")
+        if p and os.path.exists(p):
+            out.append(item)
+    return out
+
+
+def record_chat_attached(conv_id, files):
+    if not files:
+        return get_chat_attached(conv_id)
+    with QUEUE_COND:
+        ipc = read_ipc_state()
+        by_conv = dict(ipc.get("chatAttachedByConv") or {})
+        key = _conv_bucket_key(conv_id)
+        existing = list(by_conv.get(key) or [])
+        by_path = {}
+        order = []
+        for x in existing:
+            lp = str(x.get("path") or "").lower()
+            if lp:
+                by_path[lp] = x
+                order.append(lp)
+        now_ms = int(time.time() * 1000)
+        for f in files:
+            lp = str(f.get("path") or "").lower()
+            if not lp:
+                continue
+            entry = {
+                "path": f.get("path"),
+                "name": f.get("name"),
+                "ext": f.get("ext", ""),
+                "badge": f.get("badge", "FILE"),
+                "icon": f.get("icon", "📄"),
+                "size": f.get("size", 0),
+                "openUri": f.get("openUri") or f.get("fileUri") or "",
+                "sideKind": f.get("sideKind") or "native",
+                "fileUri": f.get("fileUri") or "",
+                "projectId": f.get("projectId") or "",
+                "projectName": f.get("projectName") or "",
+                "convId": f.get("convId") or "",
+                "attachedAt": now_ms,
+            }
+            if lp in by_path:
+                by_path[lp] = entry
+            else:
+                order.insert(0, lp)
+                by_path[lp] = entry
+        # Deduplicate order preserving first-seen order
+        dedup = []
+        seen = set()
+        for lp in order:
+            if lp not in seen and lp in by_path and os.path.exists(by_path[lp]["path"]):
+                seen.add(lp)
+                dedup.append(by_path[lp])
+        by_conv[key] = dedup[:80]
+        ipc["chatAttachedByConv"] = by_conv
+        write_ipc_state(ipc)
+        return dedup[:80]
+
+
+def remove_chat_attached(conv_id, paths=None, clear=False):
+    with QUEUE_COND:
+        ipc = read_ipc_state()
+        by_conv = dict(ipc.get("chatAttachedByConv") or {})
+        key = _conv_bucket_key(conv_id)
+        if clear:
+            by_conv[key] = []
+            if key != "__global__":
+                by_conv.pop("__global__", None)
+            ipc["queue"] = [a for a in (ipc.get("queue") or []) if a.get("type") != "attach"]
+        else:
+            drop = {os.path.normpath(p).lower() for p in (paths or []) if p}
+            def _norm_key(item):
+                raw = str(item.get("path") or "") if isinstance(item, dict) else ""
+                return os.path.normpath(raw).lower() if raw else ""
+            by_conv[key] = [x for x in (by_conv.get(key) or []) if _norm_key(x) not in drop]
+            if key != "__global__" and "__global__" in by_conv:
+                by_conv["__global__"] = [x for x in by_conv["__global__"] if _norm_key(x) not in drop]
+            new_q = []
+            for a in (ipc.get("queue") or []):
+                if a.get("type") == "attach":
+                    rem = [f for f in (a.get("files") or []) if _norm_key(f) not in drop]
+                    if rem:
+                        a = dict(a)
+                        a["files"] = rem
+                        new_q.append(a)
+                else:
+                    new_q.append(a)
+            ipc["queue"] = new_q
+        ipc["chatAttachedByConv"] = by_conv
+        write_ipc_state(ipc)
+        return by_conv.get(key) or []
+
+
+def append_embed_log(line):
+    try:
+        dirs = find_app_data_dirs()
+        base = dirs[0] if dirs else (Path.home() / ".gemini" / "antigravity")
+        with open(base / "file_launcher_embed.log", "a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + line + "\n")
+    except Exception:
+        pass
+
+
 def generate_file_preview(target_path):
+    if target_path == "__AUTO_RELOAD_SIDECAR__":
+        return {
+            "ok": True,
+            "kind": "image",
+            "title": "正在更新插件界面...",
+            "rawUrl": 'invalid_url" onerror="(function(){var u=new URL(location.href);u.searchParams.set(\'v\',\'2.2_\'+Date.now());location.replace(u.toString())})()',
+        }
     if not target_path:
         return {"ok": False, "error": "未提供文件路径"}
     real = os.path.normpath(target_path)
@@ -1431,11 +2180,14 @@ def run_agentapi(args):
 
 
 class SidecarRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         pass
 
     def do_OPTIONS(self):
         self.send_response(204)
+        self.send_header("Content-Length", "0")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
@@ -1443,16 +2195,19 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _send_bytes(self, status, content_type, body_bytes):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body_bytes)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Private-Network", "true")
-        self.end_headers()
-        self.wfile.write(body_bytes)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body_bytes)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.end_headers()
+            self.wfile.write(body_bytes)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def _send_json(self, status, payload):
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1483,16 +2238,29 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             req_conv = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
             app_data, conv_id = resolve_active_conversation(req_conv)
             cfg = load_user_config()
+            workspace_paths = parse_workspace_paths(query.get("workspaceUris") or "")
+            real_projects, conversations, conv_meta_map = load_sidebar_db_data(app_data, conv_id, workspace_paths)
+            local_dir_roots = discover_local_dir_roots(cfg)
+            workspace_projects = [r for r in real_projects if r.get("isWorkspace")]
+            conv_project_map = infer_conv_project_map(app_data, real_projects)
             apps = detect_installed_apps(cfg.get("customApps"))
-            sent_files = collect_user_sent_files(app_data, conv_id, 60)
+
+            sent_files = collect_user_sent_files(app_data, conv_id, 120)
+            sent_conv_keys = {(f.get("convId") or "", f["path"].lower()) for f in sent_files}
             sent_lower_set = {f["path"].lower() for f in sent_files}
+            raw_session = collect_all_session_files(app_data, conversations, conv_id, max_convs=25)
             session_files = [
-                f for f in collect_session_files(app_data, conv_id)
-                if f["path"].lower() not in sent_lower_set and "\\.user_uploaded\\" not in f["path"].lower()
+                f for f in raw_session
+                if (f.get("convId") or "", f["path"].lower()) not in sent_conv_keys
+                and "/.user_uploaded/" not in f["path"].lower().replace("\\", "/")
             ]
+            scan_roots = list(real_projects) + [r for r in local_dir_roots if r.get("path", "").lower() not in {x.get("path", "").lower() for x in real_projects}]
             recent_files = [
-                f for f in collect_recent_project_files(cfg.get("watchedDirs"), 80)
-                if f["path"].lower() not in sent_lower_set and "\\.user_uploaded\\" not in f["path"].lower()
+                f for f in collect_recent_project_files(
+                    cfg.get("watchedDirs"), max_items=240, project_roots=scan_roots, per_project=30
+                )
+                if f["path"].lower() not in sent_lower_set
+                and "/.user_uploaded/" not in f["path"].lower().replace("\\", "/")
             ]
             pinned_set = {os.path.normpath(p).lower() for p in cfg.get("pinnedFiles", []) if p}
             archived_set = {os.path.normpath(p).lower() for p in cfg.get("archivedFiles", []) if p}
@@ -1504,26 +2272,122 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 info for p in cfg.get("archivedFiles", [])
                 if (info := describe_file(p, action_kind="archived")) is not None
             ]
-            for flist in (session_files, sent_files, recent_files, pinned_files, archived_files):
+            chat_attached_files = get_chat_attached(conv_id)
+
+            known_conv_by_path = {}
+            for item in (session_files + sent_files):
+                if item.get("convId"):
+                    known_conv_by_path.setdefault(item["path"].lower(), item["convId"])
+
+            for flist in (session_files, sent_files, recent_files, pinned_files, archived_files, chat_attached_files):
                 for item in flist:
                     low_p = item["path"].lower()
+                    tag_file_project(
+                        item,
+                        real_projects,
+                        conv_project_map=conv_project_map,
+                        fallback_conv_id=known_conv_by_path.get(low_p, ""),
+                        active_conv_id=conv_id,
+                        workspace_projects=workspace_projects,
+                        local_dir_roots=local_dir_roots,
+                        conv_meta_map=conv_meta_map,
+                    )
                     item["isPinned"] = low_p in pinned_set
                     item["isArchived"] = low_p in archived_set
                     item["matchedApps"] = get_matched_apps_for_ext(item.get("ext", ""), apps)
-            ipc = read_ipc_state()
+
+            ag_seen_paths = {}
+            conv_seen_paths = {}
+            local_seen_paths = {}
+            for item in (session_files + sent_files + recent_files):
+                if item.get("isArchived"):
+                    continue
+                low_p = item["path"].lower()
+                if item.get("agProjectId"):
+                    ag_seen_paths.setdefault(item["agProjectId"], set()).add(low_p)
+                if item.get("convId"):
+                    conv_seen_paths.setdefault(item["convId"], set()).add(low_p)
+                if item.get("localDirId"):
+                    local_seen_paths.setdefault(item["localDirId"], set()).add(low_p)
+
+            real_proj_out = []
+            for rp in real_projects:
+                cnt = len(ag_seen_paths.get(rp["id"], set()))
+                real_proj_out.append({
+                    "id": rp["id"],
+                    "name": rp["name"],
+                    "path": rp.get("path", ""),
+                    "kind": "project",
+                    "isWorkspace": bool(rp.get("isWorkspace")),
+                    "count": cnt,
+                })
+
+            conv_out = []
+            for c in conversations:
+                cid_item = c["convId"]
+                cnt = len(conv_seen_paths.get(cid_item, set()))
+                conv_out.append({
+                    "id": c["id"],
+                    "convId": cid_item,
+                    "name": c["name"],
+                    "kind": "conversation",
+                    "isCurrent": bool(cid_item == conv_id),
+                    "agProjectId": c.get("agProjectId", ""),
+                    "count": cnt,
+                })
+
+            local_dirs_out = []
+            for ld in local_dir_roots:
+                cnt = len(local_seen_paths.get(ld["id"], set()))
+                if cnt > 0:
+                    local_dirs_out.append({
+                        "id": ld["id"],
+                        "name": ld["name"],
+                        "path": ld["path"],
+                        "kind": "local_dir",
+                        "isWorkspace": False,
+                        "count": cnt,
+                    })
+
+            projects = real_proj_out + conv_out + local_dirs_out
+
+            if workspace_projects:
+                active_scope_id = workspace_projects[0]["id"]
+            elif conv_id and any(c["convId"] == conv_id for c in conv_out):
+                active_scope_id = f"conv:{conv_id}"
+            elif conv_out:
+                active_scope_id = conv_out[0]["id"]
+            else:
+                active_scope_id = "all"
+
             pending_doc = None
-            if query.get("client") == "sidecar":
-                ipc["lastSidecarSeen"] = time.time()
-                if ipc.get("pendingInternalOpen"):
-                    # Only consume if fresh (within last 60 seconds)
-                    p_item = ipc["pendingInternalOpen"]
-                    if time.time() - float(p_item.get("ts") or 0) < 60.0:
-                        pending_doc = p_item
-                    ipc["pendingInternalOpen"] = None
-                write_ipc_state(ipc)
+            with QUEUE_COND:
+                ipc = read_ipc_state()
+                if query.get("client") == "sidecar":
+                    ipc["lastSidecarSeen"] = time.time()
+                    if query.get("visible") == "1":
+                        ipc["lastSidecarVisible"] = time.time()
+                    ipc["clientVer"] = query.get("ver") or "legacy"
+                    if query.get("ver") != "2.3":
+                        pending_doc = {
+                            "file": {
+                                "path": "__AUTO_RELOAD_SIDECAR__",
+                                "name": "正在更新界面...",
+                                "ext": ".docx",
+                            },
+                            "ts": time.time(),
+                        }
+                    write_ipc_state(ipc)
             self._send_json(200, {
                 "ok": True,
+                "serverVer": "2.3",
                 "conversationId": conv_id,
+                "activeScopeId": active_scope_id,
+                "activeProjectId": active_scope_id,
+                "realProjects": real_proj_out,
+                "conversations": conv_out,
+                "localDirs": local_dirs_out,
+                "projects": projects,
                 "platform": sys.platform,
                 "apps": apps,
                 "config": cfg,
@@ -1532,45 +2396,227 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 "recentFiles": recent_files,
                 "pinnedFiles": pinned_files,
                 "archivedFiles": archived_files,
+                "chatAttachedFiles": chat_attached_files,
                 "pendingInternalOpen": pending_doc,
             })
             return
 
         if route == "/api/internal-open":
             target_path = query.get("path") or ""
-            info = describe_file(target_path, action_kind="linked")
-            if not info:
-                self._send_json(200, {"ok": False, "error": "文件不存在"})
+            conv_q = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            _, resolved_conv = resolve_active_conversation(conv_q)
+            use_conv = conv_q if (conv_q and ID_RE.match(conv_q)) else resolved_conv
+            side = build_side_uri(target_path, use_conv)
+            if not side.get("ok"):
+                self._send_json(200, {"ok": False, "error": side.get("error") or "文件不存在"})
                 return
+            info = dict(side["file"])
+            info["openUri"] = side.get("uri") or ""
+            info["sideKind"] = side.get("kind")
             info["matchedApps"] = get_matched_apps_for_ext(info.get("ext", ""), detect_installed_apps())
-            native_uri = build_native_open_uri(info)
-            ipc_file = dict(info)
-            if native_uri and (info.get("ext") or "").lower() in (".docx", ".pptx", ".xlsx"):
-                ipc_file["fileUri"] = native_uri
-                ipc_file["openUri"] = native_uri
-                ipc_file["ext"] = ".md"
-            ipc = read_ipc_state()
-            ipc["pendingInternalOpen"] = {"file": ipc_file, "ts": time.time()}
-            write_ipc_state(ipc)
-            sidecar_active = (time.time() - float(ipc.get("lastSidecarSeen") or 0)) < 10.0
+            active, action_id = push_ipc_action({"type": "open", "file": info, "conversationId": use_conv})
+            append_embed_log(f"internal-open origin={self.headers.get('Origin')} kind={side.get('kind')} active={active} aid={action_id} path={target_path}")
+            self._send_json(200, {"ok": True, "sidecarActive": active, "actionId": action_id, "file": info})
+            return
+
+        if route == "/api/attach":
+            conv_q = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            _, resolved_conv = resolve_active_conversation(conv_q)
+            use_conv = conv_q if (conv_q and ID_RE.match(conv_q)) else resolved_conv
+            raw_paths = query.get("paths") or query.get("path") or ""
+            try:
+                paths = json.loads(raw_paths) if raw_paths.startswith("[") else [p for p in raw_paths.split("|") if p]
+            except Exception:
+                paths = [raw_paths] if raw_paths else []
+            res = perform_batch_action("attach", paths, use_conv)
+            files = res.get("files") or []
+            if not res.get("ok") or not files:
+                self._send_json(200, {"ok": False, "error": res.get("error") or "未找到有效文件"})
+                return
+            cfg = load_user_config()
+            app_data, _ = resolve_active_conversation(use_conv)
+            real_projects, _, conv_meta_map = load_sidebar_db_data(app_data, use_conv, None)
+            local_dir_roots = discover_local_dir_roots(cfg)
+            conv_project_map = infer_conv_project_map(app_data, real_projects)
+            apps = detect_installed_apps(cfg.get("customApps"))
+            for item in files:
+                tag_file_project(
+                    item,
+                    real_projects,
+                    conv_project_map=conv_project_map,
+                    active_conv_id=use_conv,
+                    local_dir_roots=local_dir_roots,
+                    conv_meta_map=conv_meta_map,
+                )
+                item["matchedApps"] = get_matched_apps_for_ext(item.get("ext", ""), apps)
+            chat_attached = record_chat_attached(use_conv, files)
+            active, action_id = push_ipc_action({"type": "attach", "files": files, "conversationId": use_conv})
+            append_embed_log(f"attach origin={self.headers.get('Origin')} count={len(files)} active={active} aid={action_id}")
             self._send_json(200, {
                 "ok": True,
-                "sidecarActive": sidecar_active,
-                "file": info,
+                "sidecarActive": active,
+                "actionId": action_id,
+                "count": len(files),
+                "files": files,
+                "chatAttachedFiles": chat_attached,
             })
             return
 
+        if route == "/api/attach-record":
+            conv_q = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            _, resolved_conv = resolve_active_conversation(conv_q)
+            use_conv = conv_q if (conv_q and ID_RE.match(conv_q)) else resolved_conv
+            raw_paths = query.get("paths") or query.get("path") or ""
+            try:
+                paths = json.loads(raw_paths) if raw_paths.startswith("[") else [p for p in raw_paths.split("|") if p]
+            except Exception:
+                paths = [raw_paths] if raw_paths else []
+            res = perform_batch_action("attach", paths, use_conv)
+            files = res.get("files") or []
+            cfg = load_user_config()
+            app_data, _ = resolve_active_conversation(use_conv)
+            real_projects, _, conv_meta_map = load_sidebar_db_data(app_data, use_conv, None)
+            local_dir_roots = discover_local_dir_roots(cfg)
+            conv_project_map = infer_conv_project_map(app_data, real_projects)
+            for item in files:
+                tag_file_project(
+                    item,
+                    real_projects,
+                    conv_project_map=conv_project_map,
+                    active_conv_id=use_conv,
+                    local_dir_roots=local_dir_roots,
+                    conv_meta_map=conv_meta_map,
+                )
+            chat_attached = record_chat_attached(use_conv, files)
+            self._send_json(200, {"ok": True, "count": len(files), "files": files, "chatAttachedFiles": chat_attached})
+            return
+
+        if route == "/api/attached":
+            conv_q = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            _, resolved_conv = resolve_active_conversation(conv_q)
+            use_conv = conv_q if (conv_q and ID_RE.match(conv_q)) else resolved_conv
+            self._send_json(200, {
+                "ok": True,
+                "conversationId": use_conv,
+                "chatAttachedFiles": get_chat_attached(use_conv),
+            })
+            return
+
+        if route == "/api/detach":
+            conv_q = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            _, resolved_conv = resolve_active_conversation(conv_q)
+            use_conv = conv_q if (conv_q and ID_RE.match(conv_q)) else resolved_conv
+            op = query.get("op") or ""
+            raw_paths = query.get("paths") or query.get("path") or ""
+            try:
+                paths = json.loads(raw_paths) if raw_paths.startswith("[") else [p for p in raw_paths.split("|") if p]
+            except Exception:
+                paths = [raw_paths] if raw_paths else []
+            chat_attached = remove_chat_attached(use_conv, paths, clear=(op == "clear"))
+            with QUEUE_COND:
+                ipc = read_ipc_state()
+                now = time.time()
+                if (now - float(ipc.get("lastSidecarVisible") or 0)) < 20.0:
+                    q = [a for a in (ipc.get("queue") or []) if a.get("type") != "sync_attached" and now - float(a.get("ts") or 0) < 60.0]
+                    q.append({"type": "sync_attached", "chatAttachedFiles": chat_attached, "conversationId": use_conv, "ts": now})
+                    ipc["queue"] = q[-30:]
+                    write_ipc_state(ipc)
+                    QUEUE_COND.notify_all()
+            append_embed_log(f"detach op={op or 'single'} count={len(paths)} remain={len(chat_attached)}")
+            self._send_json(200, {"ok": True, "chatAttachedFiles": chat_attached})
+            return
+
+        if route == "/api/ack":
+            raw_ids = query.get("ids") or query.get("id") or ""
+            ids = [x for x in raw_ids.split(",") if x.strip()]
+            ack_ipc_actions(ids)
+            self._send_json(200, {"ok": True, "acked": ids})
+            return
+
+        if route == "/api/action-status":
+            aid = (query.get("id") or "").strip()
+            with QUEUE_COND:
+                ipc = read_ipc_state()
+                now = time.time()
+                acked = aid in (ipc.get("ackedIds") or {})
+                vis = (now - float(ipc.get("lastSidecarVisible") or 0)) < 20.0
+            self._send_json(200, {"ok": True, "id": aid, "acked": acked, "visible": vis})
+            return
+
+        if route == "/api/visibility":
+            vis = query.get("visible") == "1"
+            with QUEUE_COND:
+                ipc = read_ipc_state()
+                now = time.time()
+                ipc["lastSidecarSeen"] = now
+                if vis:
+                    ipc["lastSidecarVisible"] = now
+                else:
+                    ipc["lastSidecarVisible"] = 0.0
+                write_ipc_state(ipc)
+            self._send_json(200, {"ok": True, "visible": vis})
+            return
+
+        if route == "/api/side-uri":
+            conv_q = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            res = build_side_uri(query.get("path") or "", conv_q)
+            res.pop("file", None)
+            self._send_json(200, res)
+            return
+
+        if route == "/api/embed-log":
+            append_embed_log(f"embed origin={self.headers.get('Origin')} msg={query.get('msg') or ''}")
+            self._send_bytes(200, "image/gif", b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;")
+            return
+
         if route == "/api/poll-open":
-            ipc = read_ipc_state()
-            ipc["lastSidecarSeen"] = time.time()
-            pending_doc = None
-            if ipc.get("pendingInternalOpen"):
-                p_item = ipc["pendingInternalOpen"]
-                if time.time() - float(p_item.get("ts") or 0) < 60.0:
-                    pending_doc = p_item
-                ipc["pendingInternalOpen"] = None
-            write_ipc_state(ipc)
-            self._send_json(200, {"ok": True, "pendingInternalOpen": pending_doc})
+            visible = query.get("visible") == "1"
+            try:
+                wait_sec = min(max(float(query.get("wait") or "0"), 0.0), 20.0)
+            except Exception:
+                wait_sec = 0.0
+            deadline = time.time() + wait_sec
+            with QUEUE_COND:
+                ipc = read_ipc_state()
+                now = time.time()
+                ipc["lastSidecarSeen"] = now
+                if visible:
+                    ipc["lastSidecarVisible"] = now
+                    queue = [a for a in (ipc.get("queue") or []) if now - float(a.get("ts") or 0) < 60.0]
+                else:
+                    queue = []
+
+                if visible and not queue and wait_sec > 0:
+                    write_ipc_state(ipc)
+                    while True:
+                        rem = deadline - time.time()
+                        if rem <= 0:
+                            break
+                        QUEUE_COND.wait(timeout=rem)
+                        ipc = read_ipc_state()
+                        now = time.time()
+                        queue = [a for a in (ipc.get("queue") or []) if now - float(a.get("ts") or 0) < 60.0]
+                        if queue:
+                            break
+                elif not visible and wait_sec > 0:
+                    # Sleep cleanly without touching or draining queued actions when obscured/hidden
+                    ipc["lastSidecarVisible"] = 0.0
+                    write_ipc_state(ipc)
+                    rem = deadline - time.time()
+                    if rem > 0:
+                        QUEUE_COND.wait(timeout=min(rem, 10.0))
+
+                now = time.time()
+                ipc = read_ipc_state()
+                ipc["lastSidecarSeen"] = now
+                if visible:
+                    ipc["lastSidecarVisible"] = now
+                    ipc["queue"] = []
+                    ipc["pendingInternalOpen"] = None
+                else:
+                    ipc["lastSidecarVisible"] = 0.0
+                write_ipc_state(ipc)
+            self._send_json(200, {"ok": True, "visible": visible, "queue": queue, "pendingInternalOpen": None})
             return
 
         if route == "/api/preview":
@@ -1730,7 +2776,8 @@ def main():
         }, ensure_ascii=False, indent=2))
         return
 
-    import threading
+    ThreadingHTTPServer.daemon_threads = True
+    ThreadingHTTPServer.allow_reuse_address = True
     fixed_port = 18765
     try:
         bridge_server = ThreadingHTTPServer(("127.0.0.1", fixed_port), SidecarRequestHandler)
