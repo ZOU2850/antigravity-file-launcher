@@ -105,13 +105,15 @@
     other: "其他",
   };
 
-  const SOURCE_ORDER = ["all", "delivered", "created", "edited", "attachment", "read", "recent", "pinned"];
+  const SOURCE_ORDER = ["all", "delivered", "created", "edited", "attachment", "reference", "uploaded", "read", "recent", "pinned"];
   const SOURCE_LABELS = {
     all: "全部来源",
     delivered: "对话交付",
     created: "AI 生成",
     edited: "AI 修改",
     attachment: "我发送的",
+    reference: "对话引用",
+    uploaded: "上传附件",
     read: "参考读取",
     recent: "工作区项目",
     pinned: "防压缩收藏",
@@ -148,9 +150,10 @@
     },
   };
 
-  const APP_VER = "2.4";
+  const APP_VER = "2.4.1";
   const MOUNT_AT = Date.now();
   let LAST_VISIBLE_AT = 0;
+  let LAST_AUTO_SYNC_AT = 0;
   let wasRealVisible = false;
   let pollAbortCtrl = null;
   let stateAbortCtrl = null;
@@ -225,6 +228,7 @@
     contextMenuFile: null,
     contextMenuFocusIdx: -1,
     pendingDeletePaths: [],
+    notifiedCodeStale: false,
   };
 
   // ==================== 宿主可见性与基础工具 ====================
@@ -337,11 +341,19 @@
     const sid = scopeId || "scope:conv";
     if (sid === "all") return true;
     if (sid === "scope:conv") {
-      return Boolean(f.isCurrentConv) || (Boolean(state.conversationId) && f.convId === state.conversationId);
+      return (
+        Boolean(f.isCurrentConv) ||
+        (Boolean(state.conversationId) &&
+          (f.convId === state.conversationId || (Array.isArray(f.convIds) && f.convIds.includes(state.conversationId))))
+      );
     }
     if (sid.startsWith("conv:")) {
       const targetCid = sid.slice(5);
-      return f.convId === targetCid || (!f.convId && targetCid === state.conversationId && Boolean(f.isCurrentConv));
+      return (
+        f.convId === targetCid ||
+        (Array.isArray(f.convIds) && f.convIds.includes(targetCid)) ||
+        (!f.convId && targetCid === state.conversationId && Boolean(f.isCurrentConv))
+      );
     }
     if (sid.startsWith("agproj:")) {
       return (f.agProjectId || "") === sid || (f.projectId || "") === sid;
@@ -557,9 +569,16 @@
     const clean = (paths || []).filter(Boolean);
     if (!clean.length) return;
     state.pendingDeletePaths = clean;
+    const hasRef = clean.some((p) => {
+      const hit = findFileByPath(p);
+      return Boolean(hit && hit.isReference);
+    });
     const box = el("delTargetPathBox");
     if (box) {
-      box.innerHTML = clean.map((p) => `<div>• ${esc(p)}</div>`).join("");
+      const warn = hasRef
+        ? `<div style="margin-top:6px;color:#d97706;font-size:11px;">⚠ 注意：勾选包含「引用」条目，确认将删除其指向的原磁盘文件；若仅需移出列表请取消并使用右键「移除记录」。</div>`
+        : "";
+      box.innerHTML = clean.map((p) => `<div>• ${esc(p)}</div>`).join("") + warn;
     }
     el("deleteConfirmModal").classList.remove("hidden");
   }
@@ -1073,6 +1092,7 @@
 
   // ==================== 视图切换、排序、分组、主从 Source × Type 筛选 ====================
   function switchTab(nextTab) {
+    const changed = state.tab !== nextTab;
     state.tab = nextTab;
     state.category = "all";
     state.sourceFilter = "all";
@@ -1082,6 +1102,9 @@
     el("tabRecent").classList.toggle("active", nextTab === "recent");
     el("archivedToggleBtn").classList.toggle("active", nextTab === "archived");
     renderAll();
+    if (changed && Date.now() - LAST_AUTO_SYNC_AT > 1200 && isRealSidecarVisible()) {
+      fetchState(false);
+    }
   }
 
   function updateSortButtonUI() {
@@ -1182,17 +1205,18 @@
 
   function applySort(files) {
     const list = [...files];
+    const timeKey = (x) => (state.tab === "sent" ? (x.sentAtMs || x.mtimeMs || 0) : (x.mtimeMs || 0));
     list.sort((a, b) => {
       if (state.tab === "session" && Boolean(a.isPinned) !== Boolean(b.isPinned)) {
         return a.isPinned ? -1 : 1;
       }
-      if (state.sortBy === "time_asc") return (a.mtimeMs || 0) - (b.mtimeMs || 0);
+      if (state.sortBy === "time_asc") return timeKey(a) - timeKey(b);
       if (state.sortBy === "name") return String(a.name || "").localeCompare(String(b.name || ""), "zh-CN");
       if (state.sortBy === "type") {
         const cmp = String(a.category || "").localeCompare(String(b.category || ""));
-        return cmp !== 0 ? cmp : (b.mtimeMs || 0) - (a.mtimeMs || 0);
+        return cmp !== 0 ? cmp : timeKey(b) - timeKey(a);
       }
-      return (b.mtimeMs || 0) - (a.mtimeMs || 0);
+      return timeKey(b) - timeKey(a);
     });
     return list;
   }
@@ -1200,6 +1224,8 @@
   function matchesSourceFilter(f, srcFilter) {
     if (!srcFilter || srcFilter === "all") return true;
     if (srcFilter === "pinned") return Boolean(f.isPinned);
+    if (srcFilter === "reference") return Boolean(f.isReference || f.sentKind === "reference");
+    if (srcFilter === "uploaded") return Boolean(f.isUserSent) && !f.isReference && f.sentKind !== "reference";
     if (srcFilter === "delivered") return f.source === "delivered" || f.actionKind === "artifact" || f.actionKind === "linked";
     return (f.source || "") === srcFilter;
   }
@@ -1211,7 +1237,20 @@
         if (!matchesSourceFilter(f, state.sourceFilter)) return false;
         if (state.search) {
           const hay = (
-            (f.name || "") + " " + (f.path || "") + " " + (f.ext || "") + " " + (f.categoryLabel || "") + " " + (f.sourceLabel || "")
+            (f.name || "") +
+            " " +
+            (f.path || "") +
+            " " +
+            (f.refTarget || "") +
+            " " +
+            (f.ext || "") +
+            " " +
+            (f.categoryLabel || "") +
+            " " +
+            (f.sourceLabel || "") +
+            " " +
+            (f.sentScopeLabel || "") +
+            (f.isReference ? " 引用 reference" : "")
           ).toLowerCase();
           if (!hay.includes(state.search)) return false;
         }
@@ -1574,14 +1613,16 @@
   function createItemElement(f) {
     const item = document.createElement("div");
     const isSelected = state.selectedPaths.has(f.path);
+    const isRef = Boolean(f.isReference || f.sentKind === "reference");
     item.className =
       "codex-item" +
       (isSelected ? " selected" : "") +
+      (isRef ? " is-reference" : "") +
       (f.missing ? " is-missing" : "");
 
     const extLabel = f.isDir ? "DIR" : (f.badge || (f.ext || "FILE").replace(".", "").toUpperCase());
     const sizeTxt = formatSize(f.size);
-    const timeTxt = formatTime(f.mtimeMs);
+    const timeTxt = formatTime(f.mtimeMs || f.sentAtMs);
     const isSent = Boolean(f.isUserSent) || state.tab === "sent";
 
     const subParts = [];
@@ -1594,7 +1635,11 @@
     }
     if (timeTxt) subParts.push(timeTxt);
     if (sizeTxt) subParts.push(sizeTxt);
-    if (!isSent && f.dir && !(f.moved && f.movedFrom)) subParts.push(f.dir);
+    if (isRef && (f.refOriginDir || f.dir) && !(f.moved && f.movedFrom)) {
+      subParts.push(`指向: ${f.refOriginDir || f.dir}`);
+    } else if (!isSent && f.dir && !(f.moved && f.movedFrom)) {
+      subParts.push(f.dir);
+    }
 
     const checkHtml = state.selectMode
       ? `<span class="sel-check ${isSelected ? "checked" : ""}" data-act="toggle-select">${isSelected ? "✓" : ""}</span>`
@@ -1611,6 +1656,7 @@
     const badgesHtml =
       (f.missing ? `<span class="missing-badge" title="文件已不存在或被移走，右键可移除记录">不存在</span>` : "") +
       (f.moved ? `<span class="moved-badge" title="原路径: ${esc(f.movedFrom || "")}">已移动</span>` : "") +
+      (isRef ? `<span class="ref-badge" title="引用壳子指向：${esc(f.refTarget || f.path)}（点击直接无感打开原文件）">${esc(f.refLabel || "引用")}</span>` : "") +
       (showSourceBadge ? `<span class="source-badge ${esc(srcCls)}">${esc(f.sourceLabel)}</span>` : "") +
       (showProjBadge ? `<span class="proj-tag" title="所属项目">${esc(f.projectName)}</span>` : "") +
       (f.isPinned ? `<span class="pin-badge" title="防上下文压缩保护中">★防压缩</span>` : "") +
@@ -2635,6 +2681,11 @@
       const res = await sidecarFetch(url, { signal: mySignal });
       const data = await res.json();
       if (!data.ok) return;
+      LAST_AUTO_SYNC_AT = Date.now();
+      if (data.codeStale && !state.notifiedCodeStale) {
+        state.notifiedCodeStale = true;
+        showToast("检测到插件后端已升级，请停用再启用 File Launcher 或重载窗口以加载新版");
+      }
 
       state.conversationId = data.conversationId || state.conversationId || convId;
       state.realProjects = data.realProjects || [];
@@ -2744,6 +2795,18 @@
 
   document.addEventListener("visibilitychange", handleVisibilityOrResize);
   window.addEventListener("resize", handleVisibilityOrResize);
+  window.addEventListener("focus", () => {
+    if (
+      isRealSidecarVisible() &&
+      Date.now() - LAST_AUTO_SYNC_AT > 1500 &&
+      !state.contextMenuFile &&
+      !state.selectMode &&
+      !state.scopeMenuOpen &&
+      !state.filterPopoverOpen
+    ) {
+      fetchState(false);
+    }
+  });
 
   if (window.sidecar && typeof window.sidecar.onWorkspaceChange === "function") {
     window.sidecar.onWorkspaceChange((uris) => {

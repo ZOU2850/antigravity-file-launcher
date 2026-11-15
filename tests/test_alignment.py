@@ -139,6 +139,55 @@ class TestDshSyncCore(unittest.TestCase):
             self.assertTrue(paths[dsh_sync.path_key(str(ws / "docs"))]["isDir"])
             self.assertFalse(any("example.com" in k or "张三" in k for k in paths))
 
+    def test_antigravity_parenthesized_references_and_fl_preview(self):
+        with tempfile.TemporaryDirectory() as td:
+            shots = Path(td) / "shots"
+            shots.mkdir()
+            shot = shots / "harness-archived-file.png"
+            shot.write_bytes(b"\x89PNG\r\n\x1a\n")
+            plan = shots / "plan (2).md"
+            plan.write_text("# plan", encoding="utf-8")
+
+            msg = (
+                f"@harness-archived-file.png（{shot}） 请顺便看下@plan (2).md（{plan}），"
+                f"不要误抓 @张三（产品经理）"
+            )
+            # 无工作区时同样必须精确解析括号内真实路径
+            items_no_ws = dsh_sync.extract_user_references_from_text(msg, workspace_roots=[], allow_dirs=True)
+            keys_no_ws = {dsh_sync.path_key(x["path"]) for x in items_no_ws}
+            self.assertIn(dsh_sync.path_key(str(shot)), keys_no_ws)
+            self.assertIn(dsh_sync.path_key(str(plan)), keys_no_ws)
+            self.assertEqual(len(keys_no_ws), 2)
+
+            # 有工作区时绝不允许生成 `name（path` 畸形缺失路径
+            ws = Path(td) / "ws"
+            ws.mkdir()
+            items_ws = dsh_sync.extract_user_references_from_text(msg, workspace_roots=[str(ws)], allow_dirs=True)
+            self.assertEqual({dsh_sync.path_key(x["path"]) for x in items_ws}, keys_no_ws)
+
+            # Comments on artifact URI 指向 fl_preview 只读镜像时能反向还原到原 Office 文件
+            real_docx = shots / "spec.docx"
+            real_docx.write_bytes(b"PK\x03\x04")
+            prev_dir = Path(td) / "conv" / "fl_preview"
+            prev_dir.mkdir(parents=True)
+            mirror_md = prev_dir / "spec.md"
+            mirror_md.write_text(f"> 📄 **spec.docx** 的只读预览（原文件未改动）　·　原文件：`{real_docx}`\n\n正文", encoding="utf-8")
+            step = {
+                "step_index": 12,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": (
+                    f"Comments on artifact URI: {mirror_md.resolve().as_uri()} (page title: \"spec.docx\")\n"
+                    f"<USER_REQUEST>\n@harness-archived-file.png（{shot}）\n</USER_REQUEST>"
+                ),
+            }
+            extracted = server_main.extract_paths_from_user_step(step, workspace_roots=[])
+            by_k = {dsh_sync.path_key(x["path"]): x for x in extracted}
+            self.assertIn(dsh_sync.path_key(str(real_docx)), by_k)
+            self.assertIn(dsh_sync.path_key(str(shot)), by_k)
+            self.assertTrue(by_k[dsh_sync.path_key(str(real_docx))]["isReference"])
+            self.assertTrue(by_k[dsh_sync.path_key(str(shot))]["isReference"])
+
     def test_tool_call_extraction(self):
         p_w = dsh_sync.extract_paths_from_tool_call("write_file", {"Path": r"D:\proj\a.md"})
         self.assertEqual(p_w, [(dsh_sync.norm_path_str(r"D:\proj\a.md"), "created")])
@@ -322,11 +371,12 @@ class TestHttpEndpoints(unittest.TestCase):
         # 1. Static files
         st, _, html_bytes = self._req("/")
         self.assertEqual(st, 200)
-        self.assertIn(b"app.js?v=2.4", html_bytes)
+        self.assertIn(b"app.js?v=2.4.1", html_bytes)
         self.assertIn(b"settingsModal", html_bytes)
         st, _, css_bytes = self._req("/styles.css")
         self.assertEqual(st, 200)
         self.assertIn(b".fl-context-menu", css_bytes)
+        self.assertIn(b".ref-badge", css_bytes)
         st, _, js_bytes = self._req("/app.js")
         self.assertEqual(st, 200)
         self.assertIn(b"openContextMenu", js_bytes)
@@ -368,13 +418,77 @@ class TestHttpEndpoints(unittest.TestCase):
         self.assertTrue(json.loads(raw)["ok"])
         self.assertFalse(doc.exists())
 
-        # 4. State payload check
-        st, _, raw = self._req("/api/state?client=sidecar&ver=2.4")
+        # 4. State payload check & Reference Shell workflow (including stale v1 sentIndex invalidation)
+        cid = "8a481173-e4c4-4c2f-a406-8a517fad5743"
+        conv_dir = self.store_dir / "brain" / cid
+        logs_dir = conv_dir / ".system_generated" / "logs"
+        up_dir = conv_dir / ".user_uploaded"
+        logs_dir.mkdir(parents=True)
+        up_dir.mkdir(parents=True)
+        ext_shot = self.base / "shots" / "harness-archived-file.png"
+        ext_shot.parent.mkdir(parents=True)
+        ext_shot.write_bytes(b"\x89PNG\r\n\x1a\n")
+        ai_doc = self.work_dir / "ai_report.md"
+        ai_doc.write_text("# AI report", encoding="utf-8")
+        up_img = up_dir / "upload_sample.png"
+        up_img.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        transcript_lines = [
+            json.dumps({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{"name": "write_file", "args": {"Path": str(ai_doc)}}],
+            }),
+            json.dumps({
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "created_at": "2026-11-15T20:49:06+08:00",
+                "content": f"<USER_REQUEST>\n@harness-archived-file.png（{ext_shot}） @ai_report.md（{ai_doc}）\n</USER_REQUEST>",
+            }),
+        ]
+        t_file = logs_dir / "transcript.jsonl"
+        t_file.write_text("\n".join(transcript_lines), encoding="utf-8")
+
+        # 刻意写入一个命中的旧版 v1 空缓存，验证 v2 schema 能自动作废重扫
+        t_stat = t_file.stat()
+        stale_sig = f"{t_stat.st_mtime_ns}:{t_stat.st_size}:{up_dir.stat().st_mtime_ns}"
+        (self.base / "data_base").mkdir(parents=True, exist_ok=True)
+        (self.base / "data_base" / "file_launcher_sent_index.json").write_text(
+            json.dumps({"version": 1, "conversations": {cid: {"sig": stale_sig, "updatedAt": 1, "items": []}}}),
+            encoding="utf-8",
+        )
+
+        st, _, raw = self._req(f"/api/state?client=sidecar&ver=2.4.1&conversationId={cid}")
         state_payload = json.loads(raw)
         self.assertTrue(state_payload["ok"])
-        self.assertEqual(state_payload["serverVer"], "2.4")
+        self.assertEqual(state_payload["serverVer"], "2.4.1")
+        self.assertIn("codeStale", state_payload)
         self.assertIn("capabilities", state_payload)
         self.assertIn("settingsPaths", state_payload)
+
+        sent_by_k = {dsh_sync.path_key(x["path"]): x for x in state_payload["sentFiles"]}
+        self.assertIn(dsh_sync.path_key(str(ext_shot)), sent_by_k)
+        self.assertIn(dsh_sync.path_key(str(ai_doc)), sent_by_k)
+        self.assertIn(dsh_sync.path_key(str(up_img)), sent_by_k)
+
+        ref_item = sent_by_k[dsh_sync.path_key(str(ext_shot))]
+        self.assertTrue(ref_item["isReference"])
+        self.assertEqual(ref_item["sentKind"], "reference")
+        self.assertEqual(ref_item["refLabel"], "引用")
+        self.assertEqual(dsh_sync.path_key(ref_item["refTarget"]), dsh_sync.path_key(str(ext_shot)))
+        self.assertFalse(sent_by_k[dsh_sync.path_key(str(up_img))]["isReference"])
+
+        # AI 产出的 ai_report.md 被引用进「我发送的」建壳后，依然完好保留在「本次产出」中
+        sess_keys = {dsh_sync.path_key(x["path"]) for x in state_payload["sessionFiles"]}
+        self.assertIn(dsh_sync.path_key(str(ai_doc)), sess_keys)
+        self.assertNotIn(dsh_sync.path_key(str(up_img)), sess_keys)
+
+        # 通过引用壳子 path 无感直接读取预览内容
+        from urllib.parse import quote
+        st, _, prev_raw = self._req(f"/api/preview?path={quote(ref_item['path'])}")
+        self.assertEqual(st, 200)
+        self.assertTrue(json.loads(prev_raw)["ok"])
 
         # 5. PDF pages & path traversal safety
         pdf_file = self.work_dir / "sample.pdf"

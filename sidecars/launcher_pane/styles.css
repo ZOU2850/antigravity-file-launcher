@@ -1726,3 +1726,26 @@ html, body {
   background: rgba(16, 185, 129, 0.14);
 }
 :root[data-theme="dark"] .cap-pill.ready { color: #34d399; }
+
+/* v2.4.1 对话引用壳子特殊标注与样式 */
+.ref-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: 3px;
+  margin-left: 5px;
+  vertical-align: middle;
+  color: #4f46e5;
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.25);
+}
+:root[data-theme="dark"] .ref-badge {
+  color: #a5b4fc;
+  background: rgba(99, 102, 241, 0.2);
+  border-color: rgba(129, 140, 248, 0.35);
+}
+.codex-item.is-reference {
+  border-left: 2px solid rgba(99, 102, 241, 0.45);
+}

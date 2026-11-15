@@ -694,10 +694,28 @@ def unarchive_files_dsh(
 # 5. sent-index 增量持久化 + 移动重连 (moved) + @引用 / 工具参数提取
 # ---------------------------------------------------------------------------
 
+SENT_INDEX_VERSION = 2
+
+
+def parse_iso_timestamp_ms(ts_str: Any) -> int:
+    """将 ISO-8601 时间戳安全转换为毫秒时间戳，异常返回 0。"""
+    if not ts_str or not isinstance(ts_str, str):
+        return 0
+    s = ts_str.strip()
+    if not s:
+        return 0
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return int(datetime.fromisoformat(s).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
 def load_sent_index(sent_index_path: Path) -> Dict[str, Any]:
     raw = read_json_safe(sent_index_path, None)
-    if not isinstance(raw, dict) or raw.get("version") != 1 or not isinstance(raw.get("conversations"), dict):
-        return {"version": 1, "conversations": {}}
+    if not isinstance(raw, dict) or raw.get("version") != SENT_INDEX_VERSION or not isinstance(raw.get("conversations"), dict):
+        return {"version": SENT_INDEX_VERSION, "conversations": {}}
     return raw
 
 
@@ -802,8 +820,9 @@ def _trim_and_resolve_candidate(
             continue
         break
 
-    # 2. 若未在磁盘找到，判断是否值得作为 missing 空壳保留
-    clean = token.split()[0].strip(".,;:!?，。；：！？)]}）】》」』'\"")
+    # 2. 若未在磁盘找到，判断是否值得作为 missing 空壳保留（剥除尾部粘连的（...）避免脏路径）
+    head_part = re.split(r"[（(]", token, maxsplit=1)[0]
+    clean = head_part.split()[0].strip(".,;:!?，。；：！？)]}）】》」』'\"") if head_part.strip() else ""
     if not clean or not _looks_like_path_token(clean):
         return None
     if re.match(r"^[A-Za-z]:[\\/]", clean) or clean.startswith(("\\\\", "/", "~/")):
@@ -838,7 +857,7 @@ def extract_mentions_from_text(
             found[k] = {"path": p, "isDir": is_dir, "exists": exists}
 
     # 1. @"..." / @'...' / @`...` 带空格引用
-    for m in re.finditer(r"""(?:^|(?<=[\s(\[{"'：:，,]))@(["'`])([^"'`\r\n]{2,360})\1""", text):
+    for m in re.finditer(r"""(?:^|(?<=[\s(\[{"'：:，,、\u4e00-\u9fff]))@(["'`])([^"'`\r\n]{2,360})\1""", text):
         cand = m.group(2).strip()
         if not _looks_like_path_token(cand) and not os.path.exists(norm_path_str(cand)):
             # 试工作区相对路径
@@ -858,7 +877,7 @@ def extract_mentions_from_text(
             record(_trim_and_resolve_candidate(cand, workspace_roots, allow_dirs=allow_dirs))
 
     # 2. 未加引号的 @path：对每个合法起始 @ 单独截取后续一段文本向回裁剪（防止同行多个 @ 相互吞并）
-    for m in re.finditer(r"""(?:^|(?<=[\s(\[{"'：:，,]))@(?=([^\s"'`<>\r\n]))""", text):
+    for m in re.finditer(r"""(?:^|(?<=[\s(\[{"'：:，,、\u4e00-\u9fff]))@(?=([^\s"'`<>\r\n]))""", text):
         tail = text[m.end():].splitlines()[0][:240]
         if not tail or tail.startswith(('"', "'", "`")):
             continue
@@ -866,6 +885,114 @@ def extract_mentions_from_text(
         next_at = re.search(r"\s@", tail)
         seg = tail[:next_at.start()] if next_at else tail
         record(_trim_and_resolve_candidate(seg, workspace_roots, allow_dirs=allow_dirs))
+
+    return list(found.values())
+
+
+def extract_user_references_from_text(
+    text: str,
+    workspace_roots: Optional[List[str]] = None,
+    allow_dirs: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    综合提取用户文本中的全部文件/目录引用（包括 Antigravity 标准 `@文件名（完整路径）` / `@文件名(路径)`、
+    `@"含空格路径"`、`@相对路径`、`@文件夹`，以及直接粘贴/括号包裹的 Windows 磁盘与 UNC 路径）。
+    返回值与 extract_mentions_from_text 一致：[{"path": str, "isDir": bool, "exists": bool}, ...]
+    """
+    if not text or not isinstance(text, str):
+        return []
+
+    found: Dict[str, Dict[str, Any]] = {}
+
+    def record_res(res: Optional[Tuple[str, bool, bool]]):
+        if not res:
+            return
+        p, is_dir, exists = res
+        k = path_key(p)
+        if not k:
+            return
+        if k not in found or (exists and not found[k]["exists"]):
+            found[k] = {"path": p, "isDir": is_dir, "exists": exists}
+
+    def resolve_inner_path(raw_inner: str) -> Optional[Tuple[str, bool, bool]]:
+        cand = (raw_inner or "").strip().strip("`\"'")
+        if not cand or re.match(r"^[a-zA-Z]+://", cand):
+            return None
+        is_abs = bool(re.match(r"^[A-Za-z]:[\\/]", cand) or cand.startswith(("\\\\", "/", "~/")))
+        if is_abs:
+            np = norm_path_str(cand)
+            if os.path.isfile(np):
+                return (np, False, True)
+            if allow_dirs and os.path.isdir(np):
+                return (np, True, True)
+            # 仅在明显是路径（含分隔符或已知扩展名）时作为 missing 壳子追踪
+            if _looks_like_path_token(cand):
+                return (np, False, False)
+            return None
+        return _trim_and_resolve_candidate(cand, workspace_roots, allow_dirs=allow_dirs)
+
+    # 1. 解析 Antigravity `@展示名（真实路径）` / `@展示名(真实路径)` 格式并从副本中屏蔽，防止后续拆分误拼
+    # 分离全角 `（...）` 与半角 `(...)`，允许全角括号内部路径包含 `(2)` / `(测试Word)` 等半角括号
+    mask_spans: List[Tuple[int, int]] = []
+    fullwidth_paren_pat = re.compile(
+        r"""(?:^|(?<=[\s(\[{"'：:，,、\u4e00-\u9fff]))@(?:(["'`])([^"'`\r\n]{1,200})\1|([^\s（）\r\n"'`<>]{1,200}))\s*（([^（）\r\n]{2,520})）"""
+    )
+    ascii_paren_pat = re.compile(
+        r"""(?:^|(?<=[\s(\[{"'：:，,、\u4e00-\u9fff]))@(?:(["'`])([^"'`\r\n]{1,200})\1|([^\s()\r\n"'`<>]{1,200}))\s*\(([^()\r\n]{2,520})\)"""
+    )
+    for pat in (fullwidth_paren_pat, ascii_paren_pat):
+        for m in pat.finditer(text):
+            res = resolve_inner_path(m.group(4))
+            if res:
+                record_res(res)
+                mask_spans.append((m.start(), m.end()))
+
+    if mask_spans:
+        mask_spans.sort()
+        merged_spans: List[Tuple[int, int]] = []
+        for s_idx, e_idx in mask_spans:
+            if not merged_spans or s_idx > merged_spans[-1][1]:
+                merged_spans.append((s_idx, e_idx))
+            else:
+                merged_spans[-1] = (merged_spans[-1][0], max(merged_spans[-1][1], e_idx))
+        parts = []
+        last_idx = 0
+        for s_idx, e_idx in merged_spans:
+            parts.append(text[last_idx:s_idx])
+            parts.append(" ")
+            last_idx = e_idx
+        parts.append(text[last_idx:])
+        remaining = "".join(parts)
+    else:
+        remaining = text
+
+    # 2. 解析其余标准 `@路径` / `@"带空格路径"` / `@文件夹`
+    for men in extract_mentions_from_text(remaining, workspace_roots=workspace_roots, allow_dirs=allow_dirs):
+        record_res((men["path"], bool(men.get("isDir")), bool(men.get("exists"))))
+
+    # 3. 兼容用户直接贴入的裸 Windows / UNC 路径（含括号、引号、中文邻接场景，仅收录磁盘真实存在目标）
+    wrapped_pats = (
+        re.compile(r"""（((?:[A-Za-z]:[\\/]|\\\\)[^（）\r\n<>|?*]{2,480})）"""),
+        re.compile(r"""\(((?:[A-Za-z]:[\\/]|\\\\)[^()\r\n<>|?*]{2,480})\)"""),
+        re.compile(r"""["']((?:[A-Za-z]:[\\/]|\\\\)[^"'\r\n<>|?*]{2,480})["']"""),
+    )
+    for wpat in wrapped_pats:
+        for m in wpat.finditer(remaining):
+            np = norm_path_str(m.group(1).strip())
+            if os.path.isfile(np):
+                record_res((np, False, True))
+            elif allow_dirs and os.path.isdir(np):
+                record_res((np, True, True))
+
+    bare_abs_pat = re.compile(
+        r"""(?:^|[\s"'(\[（【「『：:，,、\u4e00-\u9fff])((?:[A-Za-z]:[\\/]|\\\\)[^\s"'<>|?*（）()【】「」『』，。；：！？,;\r\n]+\.[A-Za-z0-9]{1,10})"""
+    )
+    for m in bare_abs_pat.finditer(remaining):
+        np = norm_path_str(m.group(1).strip().rstrip(".,;:!?，。；：！？)]}）】》」』'\""))
+        if os.path.isfile(np):
+            record_res((np, False, True))
+        elif allow_dirs and os.path.isdir(np):
+            record_res((np, True, True))
 
     return list(found.values())
 
@@ -1514,13 +1641,16 @@ def build_file_item(
     step_index: int = -1,
     *,
     is_user_sent: bool = False,
+    is_reference: bool = False,
+    ref_target: str = "",
+    sent_at_ms: int = 0,
     last_known_size: int = 0,
     last_known_mtime_ms: int = 0,
     last_known_is_dir: bool = False,
     allow_missing: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
-    构造增强文件条目（支持 20+ 类型、文件夹、可选 missing 空壳与规范 source）。
+    构造增强文件条目（支持 20+ 类型、文件夹、引用壳子、可选 missing 空壳与规范 source）。
     """
     norm = norm_path_str(raw_path)
     if not norm:
@@ -1564,6 +1694,7 @@ def build_file_item(
         or ext in IMAGE_EXTS
         or category in {"media", "archive", "design"}
     )
+    resolved_ref_target = norm_path_str(ref_target) if is_reference and ref_target else (norm if is_reference else "")
 
     return {
         "path": norm,
@@ -1573,6 +1704,7 @@ def build_file_item(
         "isDir": is_dir,
         "size": size,
         "mtimeMs": mtime_ms,
+        "sentAtMs": int(sent_at_ms or 0),
         "fileUri": file_uri,
         "badge": badge,
         "color": color,
@@ -1581,6 +1713,11 @@ def build_file_item(
         "actionKind": action_kind,
         "source": source,
         "sourceLabel": SOURCE_LABELS.get(source, "文件"),
+        "isReference": bool(is_reference),
+        "sentKind": "reference" if is_reference else ("uploaded" if is_user_sent else ""),
+        "refTarget": resolved_ref_target,
+        "refOriginDir": os.path.dirname(resolved_ref_target) if is_reference else "",
+        "refLabel": "引用" if is_reference else "",
         "stepIndex": step_index,
         "category": category,
         "categoryLabel": cat_label,
@@ -1635,9 +1772,16 @@ def reconcile_missing_and_moved(
                     is_user_sent=bool(it.get("isUserSent")),
                 )
                 if rebuilt:
-                    for carry_key in ("isUserSent", "convId", "isCurrentConv", "sentScope", "sentScopeLabel", "source", "sourceLabel"):
+                    for carry_key in (
+                        "isUserSent", "convId", "convIds", "isCurrentConv",
+                        "sentScope", "sentScopeLabel", "source", "sourceLabel",
+                        "isReference", "sentKind", "refLabel", "sentAtMs",
+                    ):
                         if carry_key in it and it[carry_key]:
                             rebuilt[carry_key] = it[carry_key]
+                    if rebuilt.get("isReference"):
+                        rebuilt["refTarget"] = rebuilt["path"]
+                        rebuilt["refOriginDir"] = os.path.dirname(rebuilt["path"])
                     rebuilt["moved"] = True
                     rebuilt["movedFrom"] = raw_p
                     existing_keys.add(path_key(cand))
@@ -1698,22 +1842,38 @@ def sync_sent_index_incremental(
             if not k:
                 continue
             item = dict(rec)
+            is_ref = bool(item.get("isReference") or item.get("sentKind") == "reference")
+            item["isReference"] = is_ref
+            item["sentKind"] = "reference" if is_ref else "uploaded"
             item["convId"] = cid
+            item["convIds"] = [cid]
             item["isCurrentConv"] = is_current
             item["sentScope"] = "current" if is_current else "history"
-            item["sentScopeLabel"] = "当前会话发送" if is_current else "历史会话发送"
+            if is_ref:
+                item["sentScopeLabel"] = "当前会话引用" if is_current else "历史会话引用"
+            else:
+                item["sentScopeLabel"] = "当前会话发送" if is_current else "历史会话发送"
 
             prev = merged_by_key.get(k)
             if not prev:
                 merged_by_key[k] = item
             else:
+                if cid not in prev.setdefault("convIds", [prev.get("convId", "") ]):
+                    prev["convIds"].append(cid)
+                # 实体上传优先级高于单纯引用壳子
+                if not is_ref and prev.get("isReference"):
+                    prev["isReference"] = False
+                    prev["sentKind"] = "uploaded"
+                    prev["sentScopeLabel"] = "当前会话发送" if (is_current or prev.get("isCurrentConv")) else "历史会话发送"
                 if is_current and prev.get("sentScope") != "current":
                     prev["sentScope"] = "current"
-                    prev["sentScopeLabel"] = "当前会话发送"
+                    prev["sentScopeLabel"] = "当前会话引用" if prev.get("isReference") else "当前会话发送"
                     prev["isCurrentConv"] = True
                     prev["convId"] = cid
                 if int(item.get("stepIndex") or 0) > int(prev.get("stepIndex") or -1):
                     prev["stepIndex"] = int(item.get("stepIndex") or 0)
+                if int(item.get("sentAtMs") or 0) > int(prev.get("sentAtMs") or 0):
+                    prev["sentAtMs"] = int(item.get("sentAtMs") or 0)
 
     # 清理超量历史缓存条数，避免 sent_index.json 无限增长
     if len(convs_store) > 80:

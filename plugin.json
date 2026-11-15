@@ -1,7 +1,7 @@
 {
   "name": "file-launcher",
   "displayName": "File Launcher",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "Codex-style Antigravity file launcher with right-sidebar preview, Source×Type dual filtering, PDF/Office page rendering, cross-conversation chat attachment, anti-compaction pinning, date-based archiving, and safe permanent delete.",
   "author": {
     "name": "ZOU2850"

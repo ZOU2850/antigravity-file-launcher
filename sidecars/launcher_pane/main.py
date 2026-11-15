@@ -34,6 +34,22 @@ import dsh_sync
 
 IS_WIN = platform.system().lower() == "windows"
 ID_RE = re.compile(r"^[0-9a-f-]{8,}$", re.IGNORECASE)
+SERVER_VER = "2.4.1"
+
+
+def _current_py_code_mtime_ns():
+    latest = 0
+    for fname in ("main.py", "dsh_sync.py"):
+        try:
+            st = (HERE / fname).stat()
+            if st.st_mtime_ns > latest:
+                latest = st.st_mtime_ns
+        except OSError:
+            pass
+    return latest
+
+
+STARTUP_PY_CODE_MTIME_NS = _current_py_code_mtime_ns()
 
 # 默认只展示对普通用户可读的成品文档与媒体文件；代码/配置/设计稿/文件夹在侧边栏全量发现并可多维筛选
 READABLE_EXTS = set(dsh_sync.DELIVERABLE_DOC_EXTS) | set(dsh_sync.IMAGE_EXTS) | {".mp4", ".mp3", ".wav", ".mkv", ".mov"}
@@ -554,6 +570,9 @@ def describe_file(
     step_index=-1,
     *,
     is_user_sent=False,
+    is_reference=False,
+    ref_target="",
+    sent_at_ms=0,
     allow_missing=False,
     last_known_size=0,
     last_known_mtime_ms=0,
@@ -564,6 +583,9 @@ def describe_file(
         action_kind=action_kind,
         step_index=step_index,
         is_user_sent=is_user_sent,
+        is_reference=is_reference,
+        ref_target=ref_target,
+        sent_at_ms=sent_at_ms,
         allow_missing=allow_missing,
         last_known_size=last_known_size,
         last_known_mtime_ms=last_known_mtime_ms,
@@ -983,17 +1005,31 @@ def tag_file_project(
 
     ag_id = ""
     ag_name = ""
-    if matched_ag:
+    # 用户发送/引用条目优先绑定所属对话的工作区项目，确保跨项目 @引用 留在当前对话/项目的「我发送的」列表
+    if item.get("isUserSent") and cid:
+        if cmeta and cmeta.get("agProjectId"):
+            ag_id = cmeta["agProjectId"]
+            ag_name = cmeta.get("agProjectName") or ""
+        elif cid == active_conv_id and workspace_projects:
+            ws0 = workspace_projects[0]
+            ag_id = ws0["id"]
+            ag_name = ws0["name"]
+        elif conv_project_map and cid in conv_project_map:
+            inferred = conv_project_map[cid]
+            ag_id = inferred["id"]
+            ag_name = inferred["name"]
+
+    if not ag_id and matched_ag:
         ag_id = matched_ag["id"]
         ag_name = matched_ag["name"]
-    elif cmeta and cmeta.get("agProjectId"):
+    elif not ag_id and cmeta and cmeta.get("agProjectId"):
         ag_id = cmeta["agProjectId"]
         ag_name = cmeta.get("agProjectName") or ""
-    elif cid and cid == active_conv_id and workspace_projects:
+    elif not ag_id and cid and cid == active_conv_id and workspace_projects:
         ws0 = workspace_projects[0]
         ag_id = ws0["id"]
         ag_name = ws0["name"]
-    elif cid and conv_project_map and cid in conv_project_map:
+    elif not ag_id and cid and conv_project_map and cid in conv_project_map:
         inferred = conv_project_map[cid]
         ag_id = inferred["id"]
         ag_name = inferred["name"]
@@ -1019,26 +1055,101 @@ def tag_file_project(
     return item
 
 
-def extract_paths_from_user_step(step, ai_created_lower_set, workspace_roots=None):
-    """Extract files/folders explicitly sent, uploaded, or @-mentioned by the human user in a USER_INPUT step."""
+def _resolve_fl_preview_origin(local_path):
+    """若路径指向 Office 只读镜像 (fl_preview/*.md)，从首行元数据反向还原原磁盘路径。"""
+    if not local_path:
+        return ""
+    low = local_path.lower().replace("/", "\\")
+    if "\\fl_preview\\" not in low or not low.endswith(".md"):
+        return ""
+    try:
+        p = Path(local_path)
+        if not p.is_file():
+            return ""
+        with p.open("r", encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(512)
+        m = re.search(r"原文件[：:]\s*`([^`\r\n]+)`", head)
+        if m:
+            return dsh_sync.norm_path_str(m.group(1).strip())
+    except Exception:
+        pass
+    return ""
+
+
+def _load_full_step_if_truncated(conv_folder, step):
+    """当 transcript.jsonl 对超长 USER_INPUT 截断 content 时，按 step_index 从 transcript_full.jsonl 取回全文。"""
+    if not isinstance(step, dict):
+        return step
+    trunc = step.get("truncated_fields") or []
+    if "content" not in trunc:
+        return step
+    full_path = conv_folder / ".system_generated" / "logs" / "transcript_full.jsonl"
+    if not full_path.is_file():
+        return step
+    target_idx = step.get("step_index")
+    try:
+        with full_path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("step_index") == target_idx and (rec.get("type") == step.get("type") or rec.get("source") == step.get("source")):
+                    return rec
+    except Exception:
+        pass
+    return step
+
+
+def extract_paths_from_user_step(step, ai_created_lower_set=None, workspace_roots=None):
+    """
+    提取用户在 USER_INPUT 步骤中发送、上传或 @引用的文件/文件夹：
+    - 实体上传 (media / .user_uploaded) 标记为 sentKind="uploaded", isReference=False
+    - 对话引用 (@文件名（路径）/ @"..." / @路径 / @目录 / Comments URI / file:/// / 贴入路径)
+      标记为 sentKind="reference", isReference=True（作为指向原文件的引用壳子）
+    注：即使用户引用的是同会话 AI 生成或工作区文件，也必须建立引用壳子，不再用 ai_created 误屏蔽。
+    """
     found = {}
     if not isinstance(step, dict):
         return []
 
-    def add_cand(raw_p, is_dir=False, allow_missing=False):
+    def add_cand(raw_p, is_dir=False, allow_missing=False, is_reference=True):
         np = dsh_sync.norm_path_str(str(raw_p or ""))
         if not np:
             return
+        mapped_preview = _resolve_fl_preview_origin(np)
+        if mapped_preview:
+            np = mapped_preview
+        if _is_internal_ignored_path(np):
+            return
         k = dsh_sync.path_key(np)
-        if not k or k in ai_created_lower_set:
+        if not k:
             return
         exists = os.path.exists(np)
         if not exists and not allow_missing:
             return
         real_dir = os.path.isdir(np) if exists else bool(is_dir)
+        is_uploaded_path = "/.user_uploaded/" in np.lower().replace("\\", "/")
+        eff_ref = False if is_uploaded_path else bool(is_reference)
         prev = found.get(k)
-        if not prev or (exists and not prev.get("exists")):
-            found[k] = {"path": np, "isDir": real_dir, "exists": exists}
+        if not prev:
+            found[k] = {
+                "path": np,
+                "isDir": real_dir,
+                "exists": exists,
+                "isReference": eff_ref,
+                "sentKind": "reference" if eff_ref else "uploaded",
+            }
+        else:
+            if exists and not prev.get("exists"):
+                prev["exists"] = True
+                prev["isDir"] = real_dir
+            # 实体上传优先级高于单纯引用
+            if not eff_ref and prev.get("isReference"):
+                prev["isReference"] = False
+                prev["sentKind"] = "uploaded"
 
     # 1. Media attachments explicitly uploaded by the user in this message
     for m in step.get("media") or []:
@@ -1048,31 +1159,44 @@ def extract_paths_from_user_step(step, ai_created_lower_set, workspace_roots=Non
         if uri:
             lp = file_uri_to_local_path(uri) if uri.lower().startswith("file://") else os.path.normpath(uri)
             if lp:
-                add_cand(lp, allow_missing=True)
+                add_cand(lp, allow_missing=True, is_reference=False)
 
-    # 2. Extract only from <USER_REQUEST>...</USER_REQUEST> (strip <CONTEXT_SUMMARY> & <SYSTEM_MESSAGE>)
+    # 2. Extract from user content (strip <CONTEXT_SUMMARY> & <SYSTEM_MESSAGE> first)
     content = step.get("content")
     if isinstance(content, str) and content:
-        for m in re.finditer(r"\[Attachment:[^\]]*\(([A-Za-z]:[\\/][^\r\n()\"'<>]+)\)\]", content):
-            add_cand(m.group(1).strip(), allow_missing=True)
-
         cleaned = re.sub(r"<CONTEXT_SUMMARY>[\s\S]*?</CONTEXT_SUMMARY>", "", content, flags=re.IGNORECASE)
         cleaned = re.sub(r"<SYSTEM_MESSAGE>[\s\S]*?</SYSTEM_MESSAGE>", "", cleaned, flags=re.IGNORECASE)
+
+        # 2a. Explicit artifact comments ("Comments on artifact URI: file:///...") -> reference shell
+        for m in re.finditer(r"Comments on artifact URI:\s*(file:///[^\s)\"'\]>`]+)", cleaned, flags=re.IGNORECASE):
+            lp = file_uri_to_local_path(m.group(1))
+            if lp:
+                add_cand(lp, allow_missing=True, is_reference=True)
+
+        # 2b. Explicit bracket attachments & inline [file "..."] annotations
+        for m in re.finditer(r"\[Attachment:[^\]]*\(([A-Za-z]:[\\/][^\r\n()\"'<>]+)\)\]", cleaned):
+            add_cand(m.group(1).strip(), allow_missing=True, is_reference=True)
+        for m in re.finditer(r'\[file\s+"([^"\r\n]+)"\]', cleaned):
+            raw_fp = m.group(1).strip()
+            is_up = "/.user_uploaded/" in raw_fp.lower().replace("\\", "/")
+            add_cand(raw_fp, allow_missing=True, is_reference=(not is_up))
+
+        # 2c. User prompt body (<USER_REQUEST>...</USER_REQUEST>, or text outside metadata)
         user_reqs = re.findall(r"<USER_REQUEST>([\s\S]*?)</USER_REQUEST>", cleaned, flags=re.IGNORECASE)
-        user_text = "\n".join(user_reqs) if user_reqs else cleaned
+        if user_reqs:
+            user_text = "\n".join(user_reqs)
+        else:
+            user_text = re.sub(r"<ADDITIONAL_METADATA>[\s\S]*?</ADDITIONAL_METADATA>", "", cleaned, flags=re.IGNORECASE)
+            user_text = re.sub(r"<USER_SETTINGS_CHANGE>[\s\S]*?</USER_SETTINGS_CHANGE>", "", user_text, flags=re.IGNORECASE)
 
         for m in re.finditer(r"file:///[^\s)\"'\]>`]+", user_text, flags=re.IGNORECASE):
             lp = file_uri_to_local_path(m.group(0))
             if lp:
-                add_cand(lp, allow_missing=True)
+                add_cand(lp, allow_missing=True, is_reference=True)
 
-        # DSH 对齐：解析 @"含空格路径" / @绝对路径 / @相对工作区路径 / @文件夹
-        for men in dsh_sync.extract_mentions_from_text(user_text, workspace_roots=workspace_roots, allow_dirs=True):
-            add_cand(men["path"], is_dir=bool(men.get("isDir")), allow_missing=True)
-
-        # 兼容直接粘贴未加 @ 的 Windows 绝对文件路径
-        for m in re.finditer(r"(?:^|[\s\"'])([A-Za-z]:[\\/][^\s\"'<>|?*]+\.[A-Za-z0-9]{1,8})", user_text):
-            add_cand(m.group(1).strip(), allow_missing=False)
+        # DSH + Antigravity 统一引用提取：@文件名（完整路径） / @"..." / @路径 / @文件夹 / 贴入绝对路径
+        for men in dsh_sync.extract_user_references_from_text(user_text, workspace_roots=workspace_roots, allow_dirs=True):
+            add_cand(men["path"], is_dir=bool(men.get("isDir")), allow_missing=True, is_reference=True)
 
     return list(found.values())
 
@@ -1182,10 +1306,9 @@ def collect_user_sent_files(
         cid_name = task["convId"]
         is_current = bool(task["isCurrent"])
         ws_roots = list((conv_roots_map or {}).get(cid_name) or workspace_roots or [])
-        ai_created = collect_ai_created_paths(conv_folder, workspace_roots=ws_roots)
         rec_map = {}
 
-        def record_raw(raw_p, step_idx=0, known_is_dir=False):
+        def record_raw(raw_p, step_idx=0, known_is_dir=False, is_reference=False, sent_at_ms=0):
             np = dsh_sync.norm_path_str(str(raw_p or ""))
             if not np or _is_internal_ignored_path(np):
                 return
@@ -1208,6 +1331,7 @@ def collect_user_sent_files(
                     mtime_ms = int(os.stat(np).st_mtime * 1000)
                 except OSError:
                     pass
+            eff_sent_ms = int(sent_at_ms or 0) or mtime_ms
             prev = rec_map.get(k)
             if not prev:
                 rec_map[k] = {
@@ -1215,11 +1339,19 @@ def collect_user_sent_files(
                     "isDir": is_dir,
                     "size": size,
                     "mtimeMs": mtime_ms,
+                    "sentAtMs": eff_sent_ms,
                     "stepIndex": int(step_idx),
+                    "isReference": bool(is_reference),
+                    "sentKind": "reference" if is_reference else "uploaded",
                 }
             else:
                 if step_idx > prev.get("stepIndex", -1):
                     prev["stepIndex"] = int(step_idx)
+                if eff_sent_ms > int(prev.get("sentAtMs") or 0):
+                    prev["sentAtMs"] = eff_sent_ms
+                if not is_reference and prev.get("isReference"):
+                    prev["isReference"] = False
+                    prev["sentKind"] = "uploaded"
                 if size > 0:
                     prev["size"] = size
                 if mtime_ms > 0:
@@ -1230,7 +1362,7 @@ def collect_user_sent_files(
             try:
                 for entry in os.scandir(up_dir):
                     if entry.is_file():
-                        record_raw(entry.path, 10000 if is_current else 5000, known_is_dir=False)
+                        record_raw(entry.path, 10000 if is_current else 5000, known_is_dir=False, is_reference=False)
             except Exception:
                 pass
 
@@ -1247,9 +1379,17 @@ def collect_user_sent_files(
                     stype = step.get("type") or ""
                     ssource = step.get("source") or ""
                     if stype == "USER_INPUT" or ssource == "USER_EXPLICIT":
+                        step = _load_full_step_if_truncated(conv_folder, step)
                         idx = int(step.get("step_index") or 0)
-                        for cand in extract_paths_from_user_step(step, ai_created, workspace_roots=ws_roots):
-                            record_raw(cand["path"], idx, known_is_dir=bool(cand.get("isDir")))
+                        step_ts_ms = dsh_sync.parse_iso_timestamp_ms(step.get("created_at"))
+                        for cand in extract_paths_from_user_step(step, workspace_roots=ws_roots):
+                            record_raw(
+                                cand["path"],
+                                idx,
+                                known_is_dir=bool(cand.get("isDir")),
+                                is_reference=bool(cand.get("isReference")),
+                                sent_at_ms=step_ts_ms,
+                            )
             except Exception:
                 pass
 
@@ -1266,11 +1406,16 @@ def collect_user_sent_files(
 
     out = []
     for raw_rec in raw_items:
+        is_ref = bool(raw_rec.get("isReference") or raw_rec.get("sentKind") == "reference")
+        sent_at_ms = int(raw_rec.get("sentAtMs") or 0)
         info = describe_file(
             raw_rec["path"],
             action_kind="user_sent",
             step_index=int(raw_rec.get("stepIndex") or 0),
             is_user_sent=True,
+            is_reference=is_ref,
+            ref_target=raw_rec["path"] if is_ref else "",
+            sent_at_ms=sent_at_ms,
             allow_missing=True,
             last_known_size=int(raw_rec.get("size") or 0),
             last_known_mtime_ms=int(raw_rec.get("mtimeMs") or 0),
@@ -1281,17 +1426,22 @@ def collect_user_sent_files(
         info["isUserSent"] = True
         info["isReadable"] = True
         info["convId"] = raw_rec.get("convId") or ""
+        info["convIds"] = raw_rec.get("convIds") or ([info["convId"]] if info["convId"] else [])
         info["isCurrentConv"] = bool(raw_rec.get("isCurrentConv"))
         info["sentScope"] = raw_rec.get("sentScope") or "history"
-        info["sentScopeLabel"] = raw_rec.get("sentScopeLabel") or "历史会话发送"
+        if is_ref:
+            info["sentScopeLabel"] = raw_rec.get("sentScopeLabel") or ("当前会话引用" if info["sentScope"] == "current" else "历史会话引用")
+        else:
+            info["sentScopeLabel"] = raw_rec.get("sentScopeLabel") or ("当前会话发送" if info["sentScope"] == "current" else "历史会话发送")
         out.append(info)
 
     out.sort(
         key=lambda x: (
             1 if x.get("sentScope") == "current" else 0,
             0 if x.get("missing") else 1,
-            x.get("mtimeMs", 0),
+            x.get("sentAtMs") or x.get("mtimeMs", 0),
             x.get("stepIndex", 0),
+            x.get("mtimeMs", 0),
         ),
         reverse=True,
     )
@@ -2168,7 +2318,7 @@ def generate_file_preview(target_path):
             "ok": True,
             "kind": "image",
             "title": "正在更新插件界面...",
-            "rawUrl": 'invalid_url" onerror="(function(){var u=new URL(location.href);u.searchParams.set(\'v\',\'2.2_\'+Date.now());location.replace(u.toString())})()',
+            "rawUrl": 'invalid_url" onerror="(function(){var u=new URL(location.href);u.searchParams.set(\'v\',\'' + SERVER_VER + '_\'+Date.now());location.replace(u.toString())})()',
         }
     if not target_path:
         return {"ok": False, "error": "未提供文件路径"}
@@ -2435,8 +2585,17 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 workspace_roots=workspace_paths,
                 force_rescan=fresh,
             )
-            sent_conv_keys = {(f.get("convId") or "", dsh_sync.path_key(f["path"])) for f in sent_files}
-            sent_lower_set = {dsh_sync.path_key(f["path"]) for f in sent_files}
+            # 只有用户实体上传才从本次产出/最近项目去重；引用壳子 (isReference=True) 在「我发送的」独立建壳保留，不隐藏原产出/项目文件
+            uploaded_conv_keys = {
+                (f.get("convId") or "", dsh_sync.path_key(f["path"]))
+                for f in sent_files
+                if not f.get("isReference")
+            }
+            uploaded_lower_set = {
+                dsh_sync.path_key(f["path"])
+                for f in sent_files
+                if not f.get("isReference")
+            }
 
             raw_session = collect_all_session_files(
                 app_data,
@@ -2449,7 +2608,7 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             )
             session_files = [
                 f for f in raw_session
-                if (f.get("convId") or "", dsh_sync.path_key(f["path"])) not in sent_conv_keys
+                if (f.get("convId") or "", dsh_sync.path_key(f["path"])) not in uploaded_conv_keys
                 and "/.user_uploaded/" not in f["path"].lower().replace("\\", "/")
             ][:max_rows]
 
@@ -2464,7 +2623,7 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                     project_roots=scan_roots,
                     per_project=35,
                 )
-                if dsh_sync.path_key(f["path"]) not in sent_lower_set
+                if dsh_sync.path_key(f["path"]) not in uploaded_lower_set
                 and "/.user_uploaded/" not in f["path"].lower().replace("\\", "/")
                 and not dsh_sync.should_suppress_by_tombstone(f["path"], tombstones)
             ][:max_rows]
@@ -2555,8 +2714,9 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 low_p = dsh_sync.path_key(item["path"])
                 if item.get("agProjectId"):
                     ag_seen_paths.setdefault(item["agProjectId"], set()).add(low_p)
-                if item.get("convId"):
-                    conv_seen_paths.setdefault(item["convId"], set()).add(low_p)
+                for c_ref in (item.get("convIds") or ([item["convId"]] if item.get("convId") else [])):
+                    if c_ref:
+                        conv_seen_paths.setdefault(c_ref, set()).add(low_p)
                 if item.get("localDirId"):
                     local_seen_paths.setdefault(item["localDirId"], set()).add(low_p)
 
@@ -2618,7 +2778,7 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                     if query.get("visible") == "1":
                         ipc["lastSidecarVisible"] = time.time()
                     ipc["clientVer"] = query.get("ver") or "legacy"
-                    if query.get("ver") != "2.4":
+                    if query.get("ver") != SERVER_VER:
                         pending_doc = {
                             "file": {
                                 "path": "__AUTO_RELOAD_SIDECAR__",
@@ -2633,7 +2793,8 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             archive_root = str(dsh_sync.resolve_archive_root(cfg, sp["defaultArchiveDir"]))
             self._send_json(200, {
                 "ok": True,
-                "serverVer": "2.4",
+                "serverVer": SERVER_VER,
+                "codeStale": _current_py_code_mtime_ns() > STARTUP_PY_CODE_MTIME_NS,
                 "conversationId": conv_id,
                 "activeScopeId": active_scope_id,
                 "activeProjectId": active_scope_id,

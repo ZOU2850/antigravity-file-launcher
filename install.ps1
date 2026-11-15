@@ -3,7 +3,7 @@
 $SourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $TargetDir = Join-Path $env:USERPROFILE ".gemini\config\plugins\file-launcher"
 
-Write-Host "Installing Antigravity File Launcher plugin (v2.4.0) to: $TargetDir" -ForegroundColor Cyan
+Write-Host "Installing Antigravity File Launcher plugin (v2.4.1) to: $TargetDir" -ForegroundColor Cyan
 
 if (-not (Test-Path $TargetDir)) {
     New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
@@ -18,7 +18,7 @@ foreach ($item in $Items) {
     }
 }
 
-Write-Host "Successfully installed File Launcher v2.4.0!" -ForegroundColor Green
+Write-Host "Successfully installed File Launcher v2.4.1!" -ForegroundColor Green
 Write-Host "If Antigravity is currently running, disable/re-enable the plugin or restart Antigravity to load the new backend." -ForegroundColor DarkGray
 Write-Host "Manage it in Antigravity: customization://file-launcher" -ForegroundColor Yellow
 Write-Host "Open panel in chat:       sidecar://file-launcher/launcher_pane/" -ForegroundColor Yellow
