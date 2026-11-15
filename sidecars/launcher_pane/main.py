@@ -25,21 +25,21 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+import dsh_sync
+
 IS_WIN = platform.system().lower() == "windows"
 ID_RE = re.compile(r"^[0-9a-f-]{8,}$", re.IGNORECASE)
 
-# 默认只展示对普通用户可读的成品文档与媒体文件；代码/配置在侧边栏仅作为单独分类标签按需查看
-READABLE_EXTS = {
-    ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".csv", ".pdf",
-    ".md", ".txt", ".rtf", ".html", ".htm",
-    ".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif",
-    ".mp4", ".mp3", ".wav"
-}
+# 默认只展示对普通用户可读的成品文档与媒体文件；代码/配置/设计稿/文件夹在侧边栏全量发现并可多维筛选
+READABLE_EXTS = set(dsh_sync.DELIVERABLE_DOC_EXTS) | set(dsh_sync.IMAGE_EXTS) | {".mp4", ".mp3", ".wav", ".mkv", ".mov"}
 DELIVERABLE_EXTS = READABLE_EXTS | {
-    ".py", ".js", ".mjs", ".ts", ".css", ".json", ".ps1", ".xml", ".yaml", ".yml", ".zip"
+    ".py", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".css", ".scss", ".json", ".ps1",
+    ".xml", ".yaml", ".yml", ".zip", ".7z", ".rar", ".sql", ".fig", ".psd",
 }
 
 CATEGORY_MAP = {
@@ -165,15 +165,20 @@ def get_data_base_dir():
     return Path.home() / "Documents" / "AntigravityFileLauncher"
 
 
+def get_store_paths():
+    cfg_dir = get_config_path().parent
+    paths = dsh_sync.get_store_paths(cfg_dir)
+    # 保持向后兼容：默认归档根目录放在 D:\projects\Archived_Docs (或 Documents/AntigravityFileLauncher/Archived_Docs)
+    paths["defaultArchiveDir"] = get_data_base_dir() / "Archived_Docs"
+    paths["pinnedManifestDir"] = get_data_base_dir() / "Pinned_Protected_Files"
+    return paths
+
+
 def default_config():
     default_dir = "D:\\projects" if (IS_WIN and Path("D:\\projects").exists()) else str(Path.home() / "Desktop")
-    return {
-        "watchedDirs": [default_dir],
-        "pinnedFiles": [],
-        "archivedFiles": [],
-        "customApps": [],
-        "extDefaults": {},
-    }
+    cfg = dsh_sync.default_settings()
+    cfg["watchedDirs"] = [default_dir]
+    return cfg
 
 
 import shutil as _shutil
@@ -247,8 +252,10 @@ def perform_batch_action(op, paths, conv_id=""):
     norm_paths = [os.path.normpath(p.strip()) for p in (paths or []) if p and isinstance(p, str) and p.strip()]
     norm_paths = [p for p in norm_paths if os.path.exists(p)]
 
-    if not norm_paths and op not in ("unpin", "unarchive"):
+    if not norm_paths and op not in ("unpin", "unarchive", "forget"):
         return {"ok": False, "error": "未找到有效的文件路径"}
+
+    sp = get_store_paths()
 
     if op == "pin":
         for p in norm_paths:
@@ -268,29 +275,44 @@ def perform_batch_action(op, paths, conv_id=""):
         return {"ok": True, "op": op, "pinnedFiles": pins}
 
     if op == "archive":
-        arch_dir = get_data_base_dir() / "Archived_Docs"
-        arch_dir.mkdir(parents=True, exist_ok=True)
-        archived_out = []
-        for p in norm_paths:
-            dst = arch_dir / os.path.basename(p)
-            try:
-                if os.path.isfile(p) and os.path.abspath(p).lower() != os.path.abspath(str(dst)).lower():
-                    _shutil.copy2(p, dst)
-            except Exception:
-                pass
-            if not any(x.lower() == p.lower() for x in archived):
-                archived.insert(0, p)
-            archived_out.append(str(dst))
-        cfg["archivedFiles"] = archived
-        save_user_config(cfg)
-        return {"ok": True, "op": op, "count": len(norm_paths), "archiveDir": str(arch_dir), "archivedFiles": archived}
+        res = dsh_sync.archive_files_dsh(
+            paths or [],
+            sp["config"],
+            sp["archiveIndex"],
+            sp["defaultArchiveDir"],
+        )
+        return {
+            "ok": True,
+            "op": op,
+            "count": len(res.get("copied") or []),
+            "copied": res.get("copied") or [],
+            "skipped": res.get("skipped") or [],
+            "archiveDir": res.get("archivedDir") or str(sp["defaultArchiveDir"]),
+            "archivedFiles": (res.get("config") or {}).get("archivedFiles") or [],
+        }
 
     if op == "unarchive":
-        raw_checks = {os.path.normpath(p.strip()).lower() for p in (paths or []) if p}
-        archived = [x for x in archived if x.lower() not in raw_checks]
-        cfg["archivedFiles"] = archived
-        save_user_config(cfg)
-        return {"ok": True, "op": op, "archivedFiles": archived}
+        res = dsh_sync.unarchive_files_dsh(
+            paths or [],
+            sp["config"],
+            sp["archiveIndex"],
+        )
+        return {
+            "ok": True,
+            "op": op,
+            "archivedFiles": (res.get("config") or {}).get("archivedFiles") or [],
+        }
+
+    if op == "forget":
+        res = dsh_sync.forget_files_dsh(
+            paths or [],
+            sp["config"],
+            sp["archiveIndex"],
+            sp["deletedIndex"],
+            sp["sentIndex"],
+            pinned_manifest_sync_cb=lambda new_pins: sync_anti_compaction_manifest(new_pins, conv_id),
+        )
+        return res
 
     if op in ("attach", "copy_chat_refs"):
         files = []
@@ -308,30 +330,22 @@ def perform_batch_action(op, paths, conv_id=""):
 
 def load_user_config():
     p = get_config_path()
-    cfg = default_config()
     if not p.exists():
-        return cfg
+        return default_config()
+    cfg = dsh_sync.load_settings(p)
+    # 兼容非常老的无 watchedDirs 配置文件：仅当键缺失（非用户显式清空）时补回默认目录
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(raw.get("watchedDirs"), list) and raw["watchedDirs"]:
-            cfg["watchedDirs"] = raw["watchedDirs"]
-        if isinstance(raw.get("pinnedFiles"), list):
-            cfg["pinnedFiles"] = raw["pinnedFiles"]
-        if isinstance(raw.get("archivedFiles"), list):
-            cfg["archivedFiles"] = raw["archivedFiles"]
-        if isinstance(raw.get("customApps"), list):
-            cfg["customApps"] = raw["customApps"]
-        if isinstance(raw.get("extDefaults"), dict):
-            cfg["extDefaults"] = raw["extDefaults"]
+        raw = dsh_sync.read_json_safe(p, {})
+        if isinstance(raw, dict) and "watchedDirs" not in raw:
+            cfg["watchedDirs"] = default_config()["watchedDirs"]
     except Exception:
         pass
     return cfg
 
 
 def save_user_config(cfg):
-    p = get_config_path()
     try:
-        p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        dsh_sync.save_settings(get_config_path(), cfg)
         return True
     except Exception:
         return False
@@ -501,73 +515,60 @@ def file_uri_to_local_path(uri_str):
 
 
 FILE_TYPE_GROUPS = [
-    ("word", "Word", {".docx", ".doc", ".rtf"}),
-    ("markdown", "Markdown", {".md"}),
-    ("ppt", "PPT", {".pptx", ".ppt"}),
-    ("excel", "Excel", {".xlsx", ".xls", ".csv"}),
+    ("word", "Word", {".docx", ".doc", ".odt", ".rtf"}),
+    ("markdown", "Markdown", {".md", ".mdx", ".markdown"}),
+    ("ppt", "PPT", {".pptx", ".ppt", ".odp", ".key"}),
+    ("excel", "Excel", {".xls", ".xlsx", ".xlsm", ".csv", ".tsv", ".ods", ".numbers"}),
     ("pdf", "PDF", {".pdf"}),
-    ("image", "图片", {".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif"}),
-    ("text", "文本/网页", {".txt", ".html", ".htm"}),
+    ("image", "图片", {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".tif", ".tiff", ".avif"}),
+    ("text", "文本/配置", {".txt", ".log", ".ini", ".cfg", ".conf", ".env", ".yaml", ".yml", ".toml", ".xml", ".properties"}),
+    ("web", "网页/样式", {".html", ".htm", ".css", ".scss", ".sass", ".less", ".vue", ".svelte", ".astro"}),
+    ("media", "音视频", {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".mp4", ".mov", ".avi", ".mkv", ".webm"}),
+    ("archive", "压缩包", {".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".zst"}),
+    ("design", "设计稿", {".fig", ".sketch", ".xd", ".psd", ".ai", ".eps"}),
+    ("database", "数据库", {".db", ".sqlite", ".sqlite3", ".mdb", ".accdb", ".parquet"}),
+    ("executable", "可执行程序", {".exe", ".msi", ".app", ".dmg", ".pkg", ".deb", ".rpm", ".appimage"}),
+    ("font", "字体", {".ttf", ".otf", ".woff", ".woff2", ".eot"}),
+    ("disk", "磁盘镜像", {".iso", ".img", ".vhd", ".vhdx"}),
+    ("binary", "二进制", {".bin", ".dll", ".so", ".dylib", ".wasm", ".o", ".a", ".lib", ".class", ".pyc"}),
+    ("folder", "文件夹", set()),
 ]
 
 
 def classify_extension(ext, is_dir=False):
-    if is_dir:
-        return "other", "文件夹", False
+    cat, _ = dsh_sync.classify_extension_full(ext, is_dir=is_dir)
+    meta = dsh_sync.CATEGORY_META_UI.get(cat, ("其他", "slate", "📄", 50))
     e = (ext or "").lower()
-    for cid, clabel, exts in FILE_TYPE_GROUPS:
-        if e in exts:
-            return cid, clabel, True
-    if e in (".mp4", ".mp3", ".wav"):
-        return "media", "音视频", True
-    return "code", "代码/其他", False
+    is_readable = bool(
+        is_dir
+        or e in dsh_sync.DELIVERABLE_DOC_EXTS
+        or e in dsh_sync.IMAGE_EXTS
+        or cat in {"media", "archive", "design"}
+    )
+    return cat, meta[0], is_readable
 
 
-def describe_file(raw_path, action_kind="recent", step_index=-1):
-    if not raw_path or not isinstance(raw_path, str):
-        return None
-    norm = os.path.normpath(raw_path.strip())
-    if not os.path.isabs(norm) or not os.path.exists(norm):
-        return None
-    try:
-        st = os.stat(norm)
-    except Exception:
-        return None
-    is_dir = os.path.isdir(norm)
-    ext = "" if is_dir else os.path.splitext(norm)[1].lower()
-    if is_dir:
-        cat = {"badge": "DIR", "color": "amber", "icon": "📁", "priority": 75}
-    else:
-        cat = CATEGORY_MAP.get(ext, {
-            "badge": (ext[1:] or "FILE").upper()[:6],
-            "color": "slate",
-            "icon": "📄",
-            "priority": 50,
-        })
-    try:
-        file_uri = Path(norm).as_uri()
-    except Exception:
-        file_uri = "file:///" + norm.replace("\\", "/")
-
-    return {
-        "path": norm,
-        "name": os.path.basename(norm) or norm,
-        "dir": os.path.dirname(norm),
-        "ext": ext,
-        "isDir": is_dir,
-        "size": 0 if is_dir else st.st_size,
-        "mtimeMs": int(st.st_mtime * 1000),
-        "fileUri": file_uri,
-        "badge": cat["badge"],
-        "color": cat["color"],
-        "icon": cat["icon"],
-        "priority": cat["priority"],
-        "actionKind": action_kind,
-        "stepIndex": step_index,
-        "category": classify_extension(ext, is_dir)[0],
-        "categoryLabel": classify_extension(ext, is_dir)[1],
-        "isReadable": classify_extension(ext, is_dir)[2],
-    }
+def describe_file(
+    raw_path,
+    action_kind="recent",
+    step_index=-1,
+    *,
+    is_user_sent=False,
+    allow_missing=False,
+    last_known_size=0,
+    last_known_mtime_ms=0,
+    last_known_is_dir=False,
+):
+    return dsh_sync.build_file_item(
+        raw_path,
+        action_kind=action_kind,
+        step_index=step_index,
+        is_user_sent=is_user_sent,
+        allow_missing=allow_missing,
+        last_known_size=last_known_size,
+        last_known_mtime_ms=last_known_mtime_ms,
+        last_known_is_dir=last_known_is_dir,
+    )
 
 
 def resolve_active_conversation(requested_conv):
@@ -1018,11 +1019,26 @@ def tag_file_project(
     return item
 
 
-def extract_paths_from_user_step(step, ai_created_lower_set):
-    """Extract ONLY files explicitly sent/attached by the human user in a USER_INPUT step."""
-    paths = []
+def extract_paths_from_user_step(step, ai_created_lower_set, workspace_roots=None):
+    """Extract files/folders explicitly sent, uploaded, or @-mentioned by the human user in a USER_INPUT step."""
+    found = {}
     if not isinstance(step, dict):
-        return paths
+        return []
+
+    def add_cand(raw_p, is_dir=False, allow_missing=False):
+        np = dsh_sync.norm_path_str(str(raw_p or ""))
+        if not np:
+            return
+        k = dsh_sync.path_key(np)
+        if not k or k in ai_created_lower_set:
+            return
+        exists = os.path.exists(np)
+        if not exists and not allow_missing:
+            return
+        real_dir = os.path.isdir(np) if exists else bool(is_dir)
+        prev = found.get(k)
+        if not prev or (exists and not prev.get("exists")):
+            found[k] = {"path": np, "isDir": real_dir, "exists": exists}
 
     # 1. Media attachments explicitly uploaded by the user in this message
     for m in step.get("media") or []:
@@ -1031,19 +1047,15 @@ def extract_paths_from_user_step(step, ai_created_lower_set):
         uri = m.get("uri") or m.get("path") or ""
         if uri:
             lp = file_uri_to_local_path(uri) if uri.lower().startswith("file://") else os.path.normpath(uri)
-            if lp and os.path.isfile(lp) and lp.lower() not in ai_created_lower_set:
-                paths.append(lp)
+            if lp:
+                add_cand(lp, allow_missing=True)
 
     # 2. Extract only from <USER_REQUEST>...</USER_REQUEST> (strip <CONTEXT_SUMMARY> & <SYSTEM_MESSAGE>)
     content = step.get("content")
     if isinstance(content, str) and content:
-        # Also capture explicit [Attachment: ... (path)] lines if present
         for m in re.finditer(r"\[Attachment:[^\]]*\(([A-Za-z]:[\\/][^\r\n()\"'<>]+)\)\]", content):
-            cand = os.path.normpath(m.group(1).strip())
-            if os.path.isfile(cand) and cand.lower() not in ai_created_lower_set:
-                paths.append(cand)
+            add_cand(m.group(1).strip(), allow_missing=True)
 
-        # Strip system summary blocks so AI artifacts in summaries are NEVER mistaken for user-sent files
         cleaned = re.sub(r"<CONTEXT_SUMMARY>[\s\S]*?</CONTEXT_SUMMARY>", "", content, flags=re.IGNORECASE)
         cleaned = re.sub(r"<SYSTEM_MESSAGE>[\s\S]*?</SYSTEM_MESSAGE>", "", cleaned, flags=re.IGNORECASE)
         user_reqs = re.findall(r"<USER_REQUEST>([\s\S]*?)</USER_REQUEST>", cleaned, flags=re.IGNORECASE)
@@ -1051,18 +1063,21 @@ def extract_paths_from_user_step(step, ai_created_lower_set):
 
         for m in re.finditer(r"file:///[^\s)\"'\]>`]+", user_text, flags=re.IGNORECASE):
             lp = file_uri_to_local_path(m.group(0))
-            if lp and os.path.isfile(lp) and lp.lower() not in ai_created_lower_set:
-                paths.append(lp)
+            if lp:
+                add_cand(lp, allow_missing=True)
 
-        for m in re.finditer(r"(?:^|[\s@\"'])([A-Za-z]:[\\/][^\s\"'<>|?*]+\.[A-Za-z0-9]{1,8})", user_text):
-            cand = os.path.normpath(m.group(1).strip())
-            if os.path.isfile(cand) and cand.lower() not in ai_created_lower_set:
-                paths.append(cand)
+        # DSH 对齐：解析 @"含空格路径" / @绝对路径 / @相对工作区路径 / @文件夹
+        for men in dsh_sync.extract_mentions_from_text(user_text, workspace_roots=workspace_roots, allow_dirs=True):
+            add_cand(men["path"], is_dir=bool(men.get("isDir")), allow_missing=True)
 
-    return paths
+        # 兼容直接粘贴未加 @ 的 Windows 绝对文件路径
+        for m in re.finditer(r"(?:^|[\s\"'])([A-Za-z]:[\\/][^\s\"'<>|?*]+\.[A-Za-z0-9]{1,8})", user_text):
+            add_cand(m.group(1).strip(), allow_missing=False)
+
+    return list(found.values())
 
 
-def collect_ai_created_paths(conv_folder):
+def collect_ai_created_paths(conv_folder, workspace_roots=None):
     """Return lowercase path set of files created/written by AI in this conversation."""
     ai_set = set()
     t_path = conv_folder / ".system_generated" / "logs" / "transcript.jsonl"
@@ -1079,79 +1094,146 @@ def collect_ai_created_paths(conv_folder):
             for tc in step.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
-                if tc.get("name") in ("write_file", "edit_file"):
-                    args = tc.get("args") or {}
-                    if isinstance(args, dict):
-                        p = unquote_arg(args.get("Path") or args.get("AbsolutePath") or args.get("TargetFile") or "")
-                        if p:
-                            ai_set.add(os.path.normpath(p).lower())
+                tname = tc.get("name") or ""
+                args = tc.get("args") or {}
+                for extracted_p, src_kind in dsh_sync.extract_paths_from_tool_call(tname, args, workspace_roots=workspace_roots):
+                    if src_kind in ("created", "edited"):
+                        ai_set.add(dsh_sync.path_key(extracted_p))
     except Exception:
         pass
     return ai_set
 
 
-def collect_user_sent_files(app_data, active_conv_id, max_items=60):
-    """Collect ONLY files sent/uploaded by the user, 100% isolated from AI deliverables."""
+def _is_internal_ignored_path(norm_path: str) -> bool:
+    lower = norm_path.lower().replace("/", "\\")
+    return (
+        ".system_generated" in lower
+        or "\\builtin\\skills\\" in lower
+        or "\\builtin\\plugins\\" in lower
+        or ("\\brain\\" in lower and "\\scratch\\" in lower)
+        or "\\browser_evidence\\" in lower
+        or "\\browser_sandbox\\" in lower
+        or "\\.fl_preview\\" in lower
+        or "\\fl_preview\\" in lower
+        or "\\file_launcher_preview\\" in lower
+        or "\\.file_launcher_preview\\" in lower
+    )
+
+
+def collect_user_sent_files(
+    app_data,
+    active_conv_id,
+    max_items=60,
+    conv_roots_map=None,
+    workspace_roots=None,
+    force_rescan=False,
+):
+    """
+    Collect files & @folders sent/uploaded by the user, backed by persistent incremental sent-index.json
+    and preserving missing shells so moved/deleted detection can work cleanly.
+    """
     if not app_data:
         return []
     brain_dir = Path(app_data) / "brain"
     if not brain_dir.exists():
         return []
 
-    sent_map = {}
+    conv_tasks = []
+    if active_conv_id and ID_RE.match(active_conv_id):
+        active_folder = brain_dir / active_conv_id
+        if active_folder.exists():
+            t_path = active_folder / ".system_generated" / "logs" / "transcript.jsonl"
+            up_dir = active_folder / ".user_uploaded"
+            sig = f"{t_path.stat().st_mtime_ns if t_path.exists() else 0}:{t_path.stat().st_size if t_path.exists() else 0}:{up_dir.stat().st_mtime_ns if up_dir.exists() else 0}"
+            conv_tasks.append({
+                "convId": active_conv_id,
+                "folder": active_folder,
+                "isCurrent": True,
+                "sig": sig,
+            })
 
-    def add_sent(raw_p, conv_folder_name, is_current_conv, step_idx=0):
-        info = describe_file(raw_p, action_kind="user_sent", step_index=step_idx)
-        if not info or info.get("isDir"):
-            return
-        lower = info["path"].lower()
-        if (
-            ".system_generated" in lower
-            or "\\builtin\\skills\\" in lower
-            or "\\builtin\\plugins\\" in lower
-            or ("\\brain\\" in lower and "\\scratch\\" in lower)
-            or "\\browser_evidence\\" in lower
-            or "\\browser_sandbox\\" in lower
-            or "\\.fl_preview\\" in lower
-            or "\\fl_preview\\" in lower
-            or "\\file_launcher_preview\\" in lower
-            or "\\.file_launcher_preview\\" in lower
-        ):
-            return
-        info["isUserSent"] = True
-        info["isReadable"] = True
-        info["convId"] = conv_folder_name
-        info["isCurrentConv"] = bool(is_current_conv)
-        info["sentScope"] = "current" if is_current_conv else "history"
-        info["sentScopeLabel"] = "当前会话发送" if is_current_conv else "历史会话发送"
+    try:
+        conv_entries = []
+        for entry in os.scandir(brain_dir):
+            if entry.is_dir() and ID_RE.match(entry.name) and entry.name != active_conv_id:
+                try:
+                    conv_entries.append((entry.stat().st_mtime, Path(entry.path), entry.name))
+                except Exception:
+                    pass
+        conv_entries.sort(key=lambda x: x[0], reverse=True)
+        for _, cpath, cname in conv_entries[:25]:
+            t_path = cpath / ".system_generated" / "logs" / "transcript.jsonl"
+            up_dir = cpath / ".user_uploaded"
+            try:
+                sig = f"{t_path.stat().st_mtime_ns if t_path.exists() else 0}:{t_path.stat().st_size if t_path.exists() else 0}:{up_dir.stat().st_mtime_ns if up_dir.exists() else 0}"
+            except Exception:
+                sig = "0:0:0"
+            conv_tasks.append({
+                "convId": cname,
+                "folder": cpath,
+                "isCurrent": False,
+                "sig": sig,
+            })
+    except Exception:
+        pass
 
-        prev = sent_map.get(lower)
-        if not prev:
-            sent_map[lower] = info
-        else:
-            if is_current_conv and prev.get("sentScope") != "current":
-                prev["sentScope"] = "current"
-                prev["sentScopeLabel"] = "当前会话发送"
-                prev["isCurrentConv"] = True
-                prev["convId"] = conv_folder_name
-            if step_idx > prev.get("stepIndex", -1):
-                prev["stepIndex"] = step_idx
+    def scan_conv_records(task):
+        conv_folder = task["folder"]
+        cid_name = task["convId"]
+        is_current = bool(task["isCurrent"])
+        ws_roots = list((conv_roots_map or {}).get(cid_name) or workspace_roots or [])
+        ai_created = collect_ai_created_paths(conv_folder, workspace_roots=ws_roots)
+        rec_map = {}
 
-    def scan_conv_for_sent(conv_folder, is_current):
-        ai_created = collect_ai_created_paths(conv_folder)
-        cid_name = conv_folder.name
+        def record_raw(raw_p, step_idx=0, known_is_dir=False):
+            np = dsh_sync.norm_path_str(str(raw_p or ""))
+            if not np or _is_internal_ignored_path(np):
+                return
+            k = dsh_sync.path_key(np)
+            if not k:
+                return
+            exists = os.path.exists(np)
+            is_dir = os.path.isdir(np) if exists else bool(known_is_dir)
+            size = 0
+            mtime_ms = 0
+            if exists and not is_dir:
+                try:
+                    st = os.stat(np)
+                    size = int(st.st_size)
+                    mtime_ms = int(st.st_mtime * 1000)
+                except OSError:
+                    pass
+            elif exists and is_dir:
+                try:
+                    mtime_ms = int(os.stat(np).st_mtime * 1000)
+                except OSError:
+                    pass
+            prev = rec_map.get(k)
+            if not prev:
+                rec_map[k] = {
+                    "path": np,
+                    "isDir": is_dir,
+                    "size": size,
+                    "mtimeMs": mtime_ms,
+                    "stepIndex": int(step_idx),
+                }
+            else:
+                if step_idx > prev.get("stepIndex", -1):
+                    prev["stepIndex"] = int(step_idx)
+                if size > 0:
+                    prev["size"] = size
+                if mtime_ms > 0:
+                    prev["mtimeMs"] = mtime_ms
 
-        # A. Scan .user_uploaded folder (100% user-uploaded attachments in Antigravity)
         up_dir = conv_folder / ".user_uploaded"
         if up_dir.exists() and up_dir.is_dir():
             try:
                 for entry in os.scandir(up_dir):
                     if entry.is_file():
-                        add_sent(entry.path, cid_name, is_current, 10000 if is_current else 5000)
+                        record_raw(entry.path, 10000 if is_current else 5000, known_is_dir=False)
             except Exception:
                 pass
 
-        # B. Scan USER_INPUT steps in transcript.jsonl
         t_path = conv_folder / ".system_generated" / "logs" / "transcript.jsonl"
         if t_path.exists():
             try:
@@ -1166,69 +1248,76 @@ def collect_user_sent_files(app_data, active_conv_id, max_items=60):
                     ssource = step.get("source") or ""
                     if stype == "USER_INPUT" or ssource == "USER_EXPLICIT":
                         idx = int(step.get("step_index") or 0)
-                        for p in extract_paths_from_user_step(step, ai_created):
-                            add_sent(p, cid_name, is_current, idx)
+                        for cand in extract_paths_from_user_step(step, ai_created, workspace_roots=ws_roots):
+                            record_raw(cand["path"], idx, known_is_dir=bool(cand.get("isDir")))
             except Exception:
                 pass
 
-    # 1. Scan active conversation first
-    if active_conv_id and ID_RE.match(active_conv_id):
-        active_folder = brain_dir / active_conv_id
-        if active_folder.exists():
-            scan_conv_for_sent(active_folder, True)
+        return list(rec_map.values())
 
-    # 2. Scan recent conversations for user-sent files
-    try:
-        conv_entries = []
-        for entry in os.scandir(brain_dir):
-            if entry.is_dir() and ID_RE.match(entry.name) and entry.name != active_conv_id:
-                try:
-                    conv_entries.append((entry.stat().st_mtime, Path(entry.path)))
-                except Exception:
-                    pass
-        conv_entries.sort(key=lambda x: x[0], reverse=True)
-        for _, cpath in conv_entries[:15]:
-            scan_conv_for_sent(cpath, False)
-    except Exception:
-        pass
+    sp = get_store_paths()
+    raw_items = dsh_sync.sync_sent_index_incremental(
+        sp["sentIndex"],
+        conv_tasks,
+        scan_conv_records,
+        force_rescan=force_rescan,
+        max_convs=20,
+    )
 
-    result = list(sent_map.values())
-    result.sort(
+    out = []
+    for raw_rec in raw_items:
+        info = describe_file(
+            raw_rec["path"],
+            action_kind="user_sent",
+            step_index=int(raw_rec.get("stepIndex") or 0),
+            is_user_sent=True,
+            allow_missing=True,
+            last_known_size=int(raw_rec.get("size") or 0),
+            last_known_mtime_ms=int(raw_rec.get("mtimeMs") or 0),
+            last_known_is_dir=bool(raw_rec.get("isDir")),
+        )
+        if not info:
+            continue
+        info["isUserSent"] = True
+        info["isReadable"] = True
+        info["convId"] = raw_rec.get("convId") or ""
+        info["isCurrentConv"] = bool(raw_rec.get("isCurrentConv"))
+        info["sentScope"] = raw_rec.get("sentScope") or "history"
+        info["sentScopeLabel"] = raw_rec.get("sentScopeLabel") or "历史会话发送"
+        out.append(info)
+
+    out.sort(
         key=lambda x: (
             1 if x.get("sentScope") == "current" else 0,
+            0 if x.get("missing") else 1,
             x.get("mtimeMs", 0),
             x.get("stepIndex", 0),
         ),
         reverse=True,
     )
-    return result[:max_items]
+    return out[:max_items]
 
 
 _CONV_SESSION_CACHE = {}
 
 
-def collect_session_files(app_data, conv_id, is_current=True):
+def collect_session_files(app_data, conv_id, is_current=True, workspace_roots=None):
     if not app_data or not conv_id or not ID_RE.match(conv_id):
         return []
     items = {}
 
-    def upsert(raw_p, action_kind, step_idx=0):
-        info = describe_file(raw_p, action_kind=action_kind, step_index=step_idx)
+    def upsert(raw_p, action_kind, step_idx=0, allow_missing=False):
+        info = describe_file(
+            raw_p,
+            action_kind=action_kind,
+            step_index=step_idx,
+            allow_missing=allow_missing,
+        )
         if not info:
             return
-        lower = info["path"].lower()
-        if (
-            ".system_generated" in lower
-            or "\\builtin\\skills\\" in lower
-            or "\\builtin\\plugins\\" in lower
-            or ("\\brain\\" in lower and "\\scratch\\" in lower)
-            or "\\.user_uploaded\\" in lower
-            or "\\.fl_preview\\" in lower
-            or "\\fl_preview\\" in lower
-            or "\\file_launcher_preview\\" in lower
-            or "\\.file_launcher_preview\\" in lower
-        ):
+        if _is_internal_ignored_path(info["path"]):
             return
+        lower = dsh_sync.path_key(info["path"])
         prev = items.get(lower)
         if not prev:
             info["convId"] = conv_id
@@ -1237,8 +1326,15 @@ def collect_session_files(app_data, conv_id, is_current=True):
             return
         if ACTION_WEIGHT.get(action_kind, 0) >= ACTION_WEIGHT.get(prev["actionKind"], 0):
             prev["actionKind"] = action_kind
+            new_src = dsh_sync.map_action_to_source(action_kind, ext=prev.get("ext", ""), is_user_sent=False)
+            prev["source"] = new_src
+            prev["sourceLabel"] = dsh_sync.SOURCE_LABELS.get(new_src, prev.get("sourceLabel") or "文件")
         if step_idx > prev["stepIndex"]:
             prev["stepIndex"] = step_idx
+        if prev.get("missing") and not info.get("missing"):
+            items[lower] = info
+            items[lower]["convId"] = conv_id
+            items[lower]["isCurrentConv"] = bool(is_current)
 
     conv_dir = Path(app_data) / "brain" / conv_id
 
@@ -1274,16 +1370,9 @@ def collect_session_files(app_data, conv_id, is_current=True):
                         continue
                     tname = tc.get("name") or ""
                     args = tc.get("args") or {}
-                    if not isinstance(args, dict):
-                        continue
-                    p = unquote_arg(args.get("Path") or args.get("AbsolutePath") or args.get("TargetFile") or "")
-                    if p:
-                        if tname == "write_file":
-                            upsert(p, "created", idx)
-                        elif tname == "edit_file":
-                            upsert(p, "edited", idx)
-                        elif tname == "read_file":
-                            upsert(p, "read", idx)
+                    for p, src_kind in dsh_sync.extract_paths_from_tool_call(tname, args, workspace_roots=workspace_roots):
+                        # 仅对 AI 明确创建或编辑的文件保留 missing 空壳，read 不主动生成 missing 避免噪音
+                        upsert(p, src_kind, idx, allow_missing=(src_kind in ("created", "edited")))
 
                 if step.get("type") == "PLANNER_RESPONSE" and isinstance(step.get("content"), str):
                     for m in re.finditer(r"file:///[^\s)\"'\]>`]+", step["content"], flags=re.IGNORECASE):
@@ -1296,6 +1385,7 @@ def collect_session_files(app_data, conv_id, is_current=True):
     result = list(items.values())
     result.sort(
         key=lambda x: (
+            0 if x.get("missing") else 1,
             1 if x["ext"] in (".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".pdf", ".md") else 0,
             ACTION_WEIGHT.get(x["actionKind"], 0),
             x["stepIndex"],
@@ -1306,7 +1396,15 @@ def collect_session_files(app_data, conv_id, is_current=True):
     return result
 
 
-def collect_all_session_files(app_data, conversations, active_conv_id, max_convs=25):
+def collect_all_session_files(
+    app_data,
+    conversations,
+    active_conv_id,
+    max_convs=20,
+    conv_roots_map=None,
+    workspace_roots=None,
+    force_rescan=False,
+):
     """Collect session deliverables per top-level conversation (with transcript mtime cache)."""
     if not app_data:
         return []
@@ -1332,11 +1430,12 @@ def collect_all_session_files(app_data, conversations, active_conv_id, max_convs
             sig = (conv_dir.stat().st_mtime, t_path.stat().st_mtime if t_path.exists() else 0.0)
         except Exception:
             sig = None
+        ws_roots = list((conv_roots_map or {}).get(cid) or workspace_roots or [])
         cached = _CONV_SESSION_CACHE.get(cid)
-        if not is_cur and cached and sig and cached[0] == sig:
+        if not force_rescan and not is_cur and cached and sig and cached[0] == sig:
             rows = [dict(x) for x in cached[1]]
         else:
-            rows = collect_session_files(app_data, cid, is_current=is_cur)
+            rows = collect_session_files(app_data, cid, is_current=is_cur, workspace_roots=ws_roots)
             if sig:
                 _CONV_SESSION_CACHE[cid] = (sig, [dict(x) for x in rows])
         for row in rows:
@@ -2093,26 +2192,61 @@ def generate_file_preview(target_path):
             return {"ok": True, "kind": "html", "title": name, "badge": "PPT 幻灯片内置阅读", "html": preview_pptx_to_html(real)}
         if ext == ".xlsx":
             return {"ok": True, "kind": "html", "title": name, "badge": "Excel 表格内置阅读", "html": preview_xlsx_to_html(real)}
-        if ext == ".csv":
+        if ext in (".csv", ".tsv"):
+            delim = "\t" if ext == ".tsv" else ","
             raw_text = Path(real).read_text(encoding="utf-8", errors="replace")
-            reader = list(csv.reader(raw_text.splitlines()[:60]))
+            all_lines = raw_text.splitlines()
+            reader = list(csv.reader(all_lines[:100], delimiter=delim))
             rows = []
             for idx, r in enumerate(reader):
                 tag = "th" if idx == 0 else "td"
                 rows.append("<tr>" + "".join(f"<{tag}>{html_mod.escape(c)}</{tag}>" for c in r) + "</tr>")
-            return {"ok": True, "kind": "html", "title": name, "badge": "CSV 表格内置阅读", "html": '<table class="doc-table">' + "".join(rows) + "</table>"}
-        if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"):
-            return {"ok": True, "kind": "image", "title": name, "badge": "图片内置预览", "rawUrl": f"/api/raw?path={html_mod.escape(real)}"}
-        if ext == ".md":
+            return {
+                "ok": True,
+                "kind": "html",
+                "title": name,
+                "badge": f"{ext[1:].upper()} 表格内置阅读",
+                "truncated": len(all_lines) > 100,
+                "totalLines": len(all_lines),
+                "html": '<table class="doc-table">' + "".join(rows) + "</table>",
+            }
+        if ext in dsh_sync.IMAGE_EXTS:
+            return {"ok": True, "kind": "image", "title": name, "badge": "图片内置预览", "rawUrl": f"/api/raw?path={quote(real)}"}
+        if ext in (".md", ".mdx", ".markdown"):
             raw_text = Path(real).read_text(encoding="utf-8", errors="replace")
-            return {"ok": True, "kind": "html", "title": name, "badge": "Markdown 内置阅读", "html": preview_markdown_to_html(raw_text)}
-        if ext in (".txt", ".json", ".py", ".js", ".mjs", ".ts", ".ps1", ".html", ".htm", ".css", ".xml", ".yaml", ".yml", ".log"):
-            raw_text = Path(real).read_text(encoding="utf-8", errors="replace")[:50000]
+            return {
+                "ok": True,
+                "kind": "html",
+                "title": name,
+                "badge": "Markdown 内置阅读",
+                "rawText": raw_text[:60000],
+                "html": preview_markdown_to_html(raw_text),
+            }
+        if ext == ".pdf":
+            return {
+                "ok": True,
+                "kind": "pdf",
+                "title": name,
+                "badge": "PDF 逐页渲染",
+                "rawUrl": f"/api/raw?path={quote(real)}",
+            }
+        if ext in dsh_sync.TEXT_PREVIEW_EXTS:
+            raw_bytes = Path(real).read_bytes()
+            max_bytes = 96 * 1024
+            truncated = len(raw_bytes) > max_bytes
+            raw_text = raw_bytes[:max_bytes].decode("utf-8", errors="replace")
+            lines = raw_text.splitlines()
+            if len(lines) > 1000:
+                raw_text = "\n".join(lines[:1000])
+                truncated = True
             return {
                 "ok": True,
                 "kind": "html",
                 "title": name,
                 "badge": "文本/代码内置阅读",
+                "truncated": truncated,
+                "totalLines": len(lines),
+                "rawText": raw_text,
                 "html": f'<pre class="doc-code"><code>{html_mod.escape(raw_text)}</code></pre>',
             }
         return {
@@ -2120,7 +2254,7 @@ def generate_file_preview(target_path):
             "kind": "unsupported",
             "title": name,
             "badge": "外部软件打开",
-            "html": f'<p class="doc-p">该格式（{html_mod.escape(ext or "未知")}）暂不支持在侧边栏直接解析文字，请点击上方<strong>「⚡ 用电脑软件打开」</strong>直接查看！</p>',
+            "html": f'<p class="doc-p">该格式（{html_mod.escape(ext or "未知")}）暂不支持在面板内直接解析文字，请点击「文件资源管理器」或使用匹配应用打开查看！</p>',
         }
     except Exception as e:
         return {"ok": False, "error": f"预览解析失败：{e}"}
@@ -2131,41 +2265,69 @@ def generate_file_preview(target_path):
 EXT_APP_MAP = {
     ".docx": ["word", "wps"],
     ".doc":  ["word", "wps"],
+    ".odt":  ["word", "wps"],
     ".rtf":  ["word", "wps", "notepad"],
     ".xlsx": ["excel", "wps"],
     ".xls":  ["excel", "wps"],
-    ".csv":  ["excel", "wps", "notepad", "vscode"],
+    ".xlsm": ["excel", "wps"],
+    ".ods":  ["excel", "wps"],
+    ".csv":  ["excel", "wps", "notepad", "vscode", "cursor"],
+    ".tsv":  ["excel", "wps", "notepad", "vscode", "cursor"],
     ".pptx": ["powerpoint", "wps"],
     ".ppt":  ["powerpoint", "wps"],
+    ".odp":  ["powerpoint", "wps"],
     ".md":   ["notepad", "vscode", "cursor", "word", "wps"],
+    ".mdx":  ["vscode", "cursor", "notepad"],
+    ".markdown": ["notepad", "vscode", "cursor", "word", "wps"],
     ".txt":  ["notepad", "vscode", "cursor", "notepadpp"],
+    ".log":  ["notepad", "vscode", "cursor", "notepadpp"],
     ".pdf":  ["edge", "chrome", "wps"],
-    ".html": ["edge", "chrome", "vscode", "notepad"],
-    ".htm":  ["edge", "chrome", "vscode", "notepad"],
+    ".html": ["edge", "chrome", "vscode", "cursor", "notepad"],
+    ".htm":  ["edge", "chrome", "vscode", "cursor", "notepad"],
     ".png":  ["edge", "chrome"],
     ".jpg":  ["edge", "chrome"],
     ".jpeg": ["edge", "chrome"],
     ".webp": ["edge", "chrome"],
-    ".svg":  ["edge", "chrome", "vscode"],
+    ".gif":  ["edge", "chrome"],
+    ".bmp":  ["edge", "chrome"],
+    ".ico":  ["edge", "chrome"],
+    ".avif": ["edge", "chrome"],
+    ".svg":  ["edge", "chrome", "vscode", "cursor"],
     ".py":   ["vscode", "cursor", "notepadpp", "notepad"],
     ".js":   ["vscode", "cursor", "notepadpp", "notepad"],
+    ".jsx":  ["vscode", "cursor", "notepadpp", "notepad"],
     ".mjs":  ["vscode", "cursor", "notepadpp", "notepad"],
+    ".cjs":  ["vscode", "cursor", "notepadpp", "notepad"],
     ".ts":   ["vscode", "cursor", "notepadpp", "notepad"],
+    ".tsx":  ["vscode", "cursor", "notepadpp", "notepad"],
     ".css":  ["vscode", "cursor", "notepadpp", "notepad"],
+    ".scss": ["vscode", "cursor", "notepadpp", "notepad"],
     ".json": ["vscode", "cursor", "notepadpp", "notepad"],
-    ".ps1":  ["vscode", "notepadpp", "notepad"],
+    ".yaml": ["vscode", "cursor", "notepadpp", "notepad"],
+    ".yml":  ["vscode", "cursor", "notepadpp", "notepad"],
+    ".toml": ["vscode", "cursor", "notepadpp", "notepad"],
+    ".xml":  ["vscode", "cursor", "edge", "notepad"],
+    ".sql":  ["vscode", "cursor", "notepadpp", "notepad"],
+    ".sh":   ["vscode", "cursor", "notepad"],
+    ".ps1":  ["vscode", "cursor", "notepadpp", "notepad"],
 }
 
 
 def get_matched_apps_for_ext(ext, all_apps):
-    """Return only the installed desktop apps that genuinely support this file extension."""
+    """Return installed desktop apps matching this extension, plus user customApps."""
     ext = (ext or "").lower()
-    allowed_ids = EXT_APP_MAP.get(ext, ["notepad", "vscode", "cursor"])
+    allowed_ids = EXT_APP_MAP.get(ext, ["vscode", "cursor", "notepad"])
     by_id = {a["id"]: a for a in (all_apps or [])}
     matched = []
+    seen = set()
     for aid in allowed_ids:
-        if aid in by_id:
+        if aid in by_id and aid not in seen:
             matched.append({"id": aid, "name": by_id[aid]["name"]})
+            seen.add(aid)
+    for app in (all_apps or []):
+        if app.get("isCustom") and app.get("id") not in seen:
+            matched.append({"id": app["id"], "name": app["name"]})
+            seen.add(app["id"])
     return matched
 
 
@@ -2235,9 +2397,14 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             global LAST_SIDECAR_SEEN, PENDING_INTERNAL_OPEN
             if query.get("client") == "sidecar":
                 LAST_SIDECAR_SEEN = time.time()
+            fresh = query.get("fresh") in ("1", "true")
             req_conv = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
             app_data, conv_id = resolve_active_conversation(req_conv)
             cfg = load_user_config()
+            sp = get_store_paths()
+            tombstones = dsh_sync.load_tombstones(sp["deletedIndex"])
+            archive_records = dsh_sync.load_archive_records(sp["archiveIndex"])
+
             workspace_paths = parse_workspace_paths(query.get("workspaceUris") or "")
             real_projects, conversations, conv_meta_map = load_sidebar_db_data(app_data, conv_id, workspace_paths)
             local_dir_roots = discover_local_dir_roots(cfg)
@@ -2245,43 +2412,117 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             conv_project_map = infer_conv_project_map(app_data, real_projects)
             apps = detect_installed_apps(cfg.get("customApps"))
 
-            sent_files = collect_user_sent_files(app_data, conv_id, 120)
-            sent_conv_keys = {(f.get("convId") or "", f["path"].lower()) for f in sent_files}
-            sent_lower_set = {f["path"].lower() for f in sent_files}
-            raw_session = collect_all_session_files(app_data, conversations, conv_id, max_convs=25)
+            # 为每个会话建立工作区根路径映射，以支持 @相对路径 和 移动重连
+            proj_path_by_id = {rp["id"]: rp.get("path", "") for rp in real_projects if rp.get("path")}
+            conv_roots_map = {}
+            for c_row in conversations:
+                cid_k = c_row.get("convId") or ""
+                pid_k = conv_project_map.get(cid_k) or c_row.get("agProjectId") or ""
+                roots_for_c = []
+                if pid_k and proj_path_by_id.get(pid_k):
+                    roots_for_c.append(proj_path_by_id[pid_k])
+                for wp in workspace_paths:
+                    if wp not in roots_for_c:
+                        roots_for_c.append(wp)
+                conv_roots_map[cid_k] = roots_for_c
+
+            max_rows = int(cfg.get("maxRows") or 800)
+            sent_files = collect_user_sent_files(
+                app_data,
+                conv_id,
+                min(max_rows, 200),
+                conv_roots_map=conv_roots_map,
+                workspace_roots=workspace_paths,
+                force_rescan=fresh,
+            )
+            sent_conv_keys = {(f.get("convId") or "", dsh_sync.path_key(f["path"])) for f in sent_files}
+            sent_lower_set = {dsh_sync.path_key(f["path"]) for f in sent_files}
+
+            raw_session = collect_all_session_files(
+                app_data,
+                conversations,
+                conv_id,
+                max_convs=20,
+                conv_roots_map=conv_roots_map,
+                workspace_roots=workspace_paths,
+                force_rescan=fresh,
+            )
             session_files = [
                 f for f in raw_session
-                if (f.get("convId") or "", f["path"].lower()) not in sent_conv_keys
+                if (f.get("convId") or "", dsh_sync.path_key(f["path"])) not in sent_conv_keys
                 and "/.user_uploaded/" not in f["path"].lower().replace("\\", "/")
+            ][:max_rows]
+
+            scan_roots = list(real_projects) + [
+                r for r in local_dir_roots
+                if r.get("path", "").lower() not in {x.get("path", "").lower() for x in real_projects}
             ]
-            scan_roots = list(real_projects) + [r for r in local_dir_roots if r.get("path", "").lower() not in {x.get("path", "").lower() for x in real_projects}]
             recent_files = [
                 f for f in collect_recent_project_files(
-                    cfg.get("watchedDirs"), max_items=240, project_roots=scan_roots, per_project=30
+                    cfg.get("watchedDirs"),
+                    max_items=min(max_rows, 320),
+                    project_roots=scan_roots,
+                    per_project=35,
                 )
-                if f["path"].lower() not in sent_lower_set
+                if dsh_sync.path_key(f["path"]) not in sent_lower_set
                 and "/.user_uploaded/" not in f["path"].lower().replace("\\", "/")
-            ]
-            pinned_set = {os.path.normpath(p).lower() for p in cfg.get("pinnedFiles", []) if p}
-            archived_set = {os.path.normpath(p).lower() for p in cfg.get("archivedFiles", []) if p}
-            pinned_files = [
-                info for p in cfg.get("pinnedFiles", [])
-                if (info := describe_file(p, action_kind="pinned")) is not None
-            ]
-            archived_files = [
-                info for p in cfg.get("archivedFiles", [])
-                if (info := describe_file(p, action_kind="archived")) is not None
-            ]
+                and not dsh_sync.should_suppress_by_tombstone(f["path"], tombstones)
+            ][:max_rows]
+
+            search_dirs_for_moved = [r.get("path", "") for r in scan_roots if r.get("path")]
+            sent_files = dsh_sync.reconcile_missing_and_moved(sent_files, tombstones, search_dirs_for_moved, sp["deletedIndex"])
+            session_files = dsh_sync.reconcile_missing_and_moved(session_files, tombstones, search_dirs_for_moved, sp["deletedIndex"])
+
+            pinned_set = {dsh_sync.path_key(p) for p in cfg.get("pinnedFiles", []) if p}
+            archived_set = {dsh_sync.path_key(p) for p in cfg.get("archivedFiles", []) if p} | set(archive_records.keys())
+            pinned_files = []
+            for p in cfg.get("pinnedFiles", []):
+                info = describe_file(p, action_kind="pinned", allow_missing=True)
+                if info is not None and not dsh_sync.should_suppress_by_tombstone(info["path"], tombstones):
+                    pinned_files.append(info)
+            pinned_files = dsh_sync.reconcile_missing_and_moved(pinned_files, tombstones, search_dirs_for_moved, sp["deletedIndex"])
+
+            archived_files = []
+            archived_seen_keys = set()
+            for p in cfg.get("archivedFiles", []):
+                info = describe_file(p, action_kind="archived", allow_missing=True)
+                if info is not None:
+                    k = dsh_sync.path_key(info["path"])
+                    rec = archive_records.get(k) or {}
+                    info["archiveInfo"] = rec
+                    if rec.get("archivedAt"):
+                        info["archivedAt"] = rec["archivedAt"]
+                    archived_files.append(info)
+                    archived_seen_keys.add(k)
+            for ak, rec in archive_records.items():
+                if ak in archived_seen_keys:
+                    continue
+                src_p = rec.get("sourcePath") or ""
+                if not src_p:
+                    continue
+                info = describe_file(
+                    src_p,
+                    action_kind="archived",
+                    allow_missing=True,
+                    last_known_size=int(rec.get("size") or 0),
+                    last_known_mtime_ms=int(rec.get("archivedAt") or 0),
+                )
+                if info is not None:
+                    info["archiveInfo"] = rec
+                    info["archivedAt"] = rec.get("archivedAt") or 0
+                    archived_files.append(info)
+            archived_files.sort(key=lambda x: x.get("archivedAt") or x.get("mtimeMs") or 0, reverse=True)
+
             chat_attached_files = get_chat_attached(conv_id)
 
             known_conv_by_path = {}
             for item in (session_files + sent_files):
                 if item.get("convId"):
-                    known_conv_by_path.setdefault(item["path"].lower(), item["convId"])
+                    known_conv_by_path.setdefault(dsh_sync.path_key(item["path"]), item["convId"])
 
             for flist in (session_files, sent_files, recent_files, pinned_files, archived_files, chat_attached_files):
                 for item in flist:
-                    low_p = item["path"].lower()
+                    low_p = dsh_sync.path_key(item["path"])
                     tag_file_project(
                         item,
                         real_projects,
@@ -2294,6 +2535,15 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                     )
                     item["isPinned"] = low_p in pinned_set
                     item["isArchived"] = low_p in archived_set
+                    if low_p in archive_records and "archiveInfo" not in item:
+                        item["archiveInfo"] = archive_records[low_p]
+                    if not item.get("source"):
+                        item["source"] = dsh_sync.map_action_to_source(
+                            item.get("actionKind", "recent"),
+                            ext=item.get("ext", ""),
+                            is_user_sent=bool(item.get("isUserSent")),
+                        )
+                        item["sourceLabel"] = dsh_sync.SOURCE_LABELS.get(item["source"], "文件")
                     item["matchedApps"] = get_matched_apps_for_ext(item.get("ext", ""), apps)
 
             ag_seen_paths = {}
@@ -2302,7 +2552,7 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             for item in (session_files + sent_files + recent_files):
                 if item.get("isArchived"):
                     continue
-                low_p = item["path"].lower()
+                low_p = dsh_sync.path_key(item["path"])
                 if item.get("agProjectId"):
                     ag_seen_paths.setdefault(item["agProjectId"], set()).add(low_p)
                 if item.get("convId"):
@@ -2368,7 +2618,7 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                     if query.get("visible") == "1":
                         ipc["lastSidecarVisible"] = time.time()
                     ipc["clientVer"] = query.get("ver") or "legacy"
-                    if query.get("ver") != "2.3":
+                    if query.get("ver") != "2.4":
                         pending_doc = {
                             "file": {
                                 "path": "__AUTO_RELOAD_SIDECAR__",
@@ -2378,9 +2628,12 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                             "ts": time.time(),
                         }
                     write_ipc_state(ipc)
+            pdf_ready = bool(dsh_sync.find_executable(["pdfinfo"]) and dsh_sync.find_executable(["pdftoppm"]))
+            office_ready = bool(pdf_ready and dsh_sync.find_executable(["soffice", "libreoffice"]))
+            archive_root = str(dsh_sync.resolve_archive_root(cfg, sp["defaultArchiveDir"]))
             self._send_json(200, {
                 "ok": True,
-                "serverVer": "2.3",
+                "serverVer": "2.4",
                 "conversationId": conv_id,
                 "activeScopeId": active_scope_id,
                 "activeProjectId": active_scope_id,
@@ -2391,6 +2644,13 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 "platform": sys.platform,
                 "apps": apps,
                 "config": cfg,
+                "archiveRoot": archive_root,
+                "archiveRecords": archive_records,
+                "settingsPaths": {k: str(v) for k, v in sp.items()},
+                "capabilities": {
+                    "pdfPages": pdf_ready,
+                    "officePages": office_ready,
+                },
                 "sessionFiles": session_files,
                 "sentFiles": sent_files,
                 "recentFiles": recent_files,
@@ -2662,9 +2922,65 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, perform_batch_action(op, paths, conv_id))
             return
 
+        if route == "/api/open-folder":
+            target_path = query.get("path") or ""
+            res = perform_file_action(target_path, mode="reveal")
+            self._send_json(200, res)
+            return
+
+        if route == "/api/pdf-pages":
+            target_path = query.get("path") or ""
+            cfg = load_user_config()
+            sp = get_store_paths()
+            res = dsh_sync.render_document_pages(
+                target_path,
+                sp["rendersDir"],
+                pdf_max_pages=cfg.get("pdfMaxPages", 20),
+                pdf_dpi=cfg.get("pdfDpi", 110),
+            )
+            self._send_json(200, res)
+            return
+
+        if route == "/api/pdf-image":
+            token = query.get("token") or ""
+            page_str = query.get("page") or "1"
+            sp = get_store_paths()
+            img_path = dsh_sync.resolve_render_image_path(sp["rendersDir"], token, page_str)
+            if not img_path:
+                self._send_bytes(404, "text/plain; charset=utf-8", b"Rendered page not found")
+                return
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                data_bytes = img_path.read_bytes()
+                self.send_header("Content-Length", str(len(data_bytes)))
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data_bytes)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+
+        if route == "/api/settings":
+            cfg = load_user_config()
+            sp = get_store_paths()
+            pdf_ready = bool(dsh_sync.find_executable(["pdfinfo"]) and dsh_sync.find_executable(["pdftoppm"]))
+            office_ready = bool(pdf_ready and dsh_sync.find_executable(["soffice", "libreoffice"]))
+            self._send_json(200, {
+                "ok": True,
+                "settings": cfg,
+                "archiveRoot": str(dsh_sync.resolve_archive_root(cfg, sp["defaultArchiveDir"])),
+                "paths": {k: str(v) for k, v in sp.items()},
+                "apps": detect_installed_apps(cfg.get("customApps")),
+                "capabilities": {"pdfPages": pdf_ready, "officePages": office_ready},
+            })
+            return
+
         if route == "/api/pin":
             target_path = (query.get("path") or "").strip()
             op = query.get("op") or "add"
+            conv_id = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
             if not target_path:
                 self._send_json(200, {"ok": False, "error": "Missing path"})
                 return
@@ -2678,9 +2994,10 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(200, {"ok": False, "error": f"Path not found: {norm}"})
                     return
                 if not any(p.lower() == norm.lower() for p in pins):
-                    pins.append(norm)
+                    pins.insert(0, norm)
             cfg["pinnedFiles"] = pins
             save_user_config(cfg)
+            sync_anti_compaction_manifest(pins, conv_id)
             self._send_json(200, {"ok": True, "pinnedFiles": pins})
             return
 
@@ -2723,6 +3040,7 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 cfg["customApps"] = [a for a in cfg["customApps"] if a.get("name", "").lower() != name.lower()]
                 save_user_config(cfg)
 
+            cfg = load_user_config()
             self._send_json(200, {"ok": True, "config": cfg, "apps": detect_installed_apps(cfg.get("customApps"))})
             return
 
@@ -2751,6 +3069,141 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             msg = data.get("message") or ""
             model = data.get("model") or "flash"
             self._send_json(200, run_agentapi(["new-conversation", "--model", model, msg]))
+            return
+
+        if route == "/api/settings":
+            sp = get_store_paths()
+            patch = data.get("settings") if isinstance(data.get("settings"), dict) else data
+            cfg = dsh_sync.update_settings_patch(sp["config"], patch if isinstance(patch, dict) else {})
+            pdf_ready = bool(dsh_sync.find_executable(["pdfinfo"]) and dsh_sync.find_executable(["pdftoppm"]))
+            office_ready = bool(pdf_ready and dsh_sync.find_executable(["soffice", "libreoffice"]))
+            self._send_json(200, {
+                "ok": True,
+                "settings": cfg,
+                "config": cfg,
+                "archiveRoot": str(dsh_sync.resolve_archive_root(cfg, sp["defaultArchiveDir"])),
+                "paths": {k: str(v) for k, v in sp.items()},
+                "apps": detect_installed_apps(cfg.get("customApps")),
+                "capabilities": {"pdfPages": pdf_ready, "officePages": office_ready},
+            })
+            return
+
+        if route == "/api/batch":
+            op = str(data.get("op") or "")
+            paths = data.get("paths") or ([data.get("path")] if data.get("path") else [])
+            conv_id = data.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            self._send_json(200, perform_batch_action(op, paths, conv_id))
+            return
+
+        if route == "/api/open":
+            target_path = str(data.get("path") or "")
+            mode = str(data.get("mode") or "default")
+            app_id = str(data.get("appId") or "")
+            custom_exe = str(data.get("customExe") or "")
+            remember = bool(data.get("rememberExt"))
+            if remember and target_path and app_id:
+                ext = os.path.splitext(target_path)[1].lower()
+                if ext:
+                    cfg = load_user_config()
+                    cfg.setdefault("extDefaults", {})[ext] = app_id
+                    save_user_config(cfg)
+            self._send_json(200, perform_file_action(target_path, mode=mode, app_id=app_id, custom_exe=custom_exe))
+            return
+
+        if route == "/api/open-folder":
+            target_path = str(data.get("path") or "")
+            self._send_json(200, perform_file_action(target_path, mode="reveal"))
+            return
+
+        if route == "/api/pin":
+            target_path = str(data.get("path") or "").strip()
+            op = str(data.get("op") or "add")
+            conv_id = data.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            if not target_path:
+                self._send_json(200, {"ok": False, "error": "Missing path"})
+                return
+            norm = os.path.normpath(target_path)
+            cfg = load_user_config()
+            pins = list(cfg.get("pinnedFiles") or [])
+            if op == "remove":
+                pins = [p for p in pins if p.lower() != norm.lower()]
+            else:
+                if not os.path.exists(norm):
+                    self._send_json(200, {"ok": False, "error": f"Path not found: {norm}"})
+                    return
+                if not any(p.lower() == norm.lower() for p in pins):
+                    pins.insert(0, norm)
+            cfg["pinnedFiles"] = pins
+            save_user_config(cfg)
+            sync_anti_compaction_manifest(pins, conv_id)
+            self._send_json(200, {"ok": True, "pinnedFiles": pins})
+            return
+
+        if route == "/api/forget":
+            paths = data.get("paths") or ([data.get("path")] if data.get("path") else [])
+            conv_id = data.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            sp = get_store_paths()
+            res = dsh_sync.forget_files_dsh(
+                paths,
+                sp["config"],
+                sp["archiveIndex"],
+                sp["deletedIndex"],
+                sp["sentIndex"],
+                pinned_manifest_sync_cb=lambda new_pins: sync_anti_compaction_manifest(new_pins, conv_id),
+            )
+            if res.get("ok") and conv_id and res.get("forgotten"):
+                try:
+                    remove_chat_attached(conv_id, res["forgotten"])
+                except Exception:
+                    pass
+            self._send_json(200, res)
+            return
+
+        if route == "/api/delete":
+            paths = data.get("paths") or ([data.get("path")] if data.get("path") else [])
+            confirm = data.get("confirm") is True
+            conv_id = data.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+            sp = get_store_paths()
+            preview_roots = []
+            if app_dirs := find_app_data_dirs():
+                brain_p = Path(app_dirs[0]) / "brain"
+                if brain_p.is_dir():
+                    try:
+                        preview_roots = [Path(e.path) / "fl_preview" for e in os.scandir(brain_p) if e.is_dir()]
+                    except Exception:
+                        pass
+            res = dsh_sync.delete_files_permanently_dsh(
+                paths,
+                confirm,
+                sp["config"],
+                sp["archiveIndex"],
+                sp["deletedIndex"],
+                sp["sentIndex"],
+                preview_roots=preview_roots,
+                renders_dir=sp["rendersDir"],
+                pinned_manifest_sync_cb=lambda new_pins: sync_anti_compaction_manifest(new_pins, conv_id),
+            )
+            if res.get("deleted") and conv_id:
+                try:
+                    remove_chat_attached(conv_id, res["deleted"])
+                except Exception:
+                    pass
+            self._send_json(200, res)
+            return
+
+        if route == "/api/pdf-pages":
+            target_path = str(data.get("path") or "")
+            cfg = load_user_config()
+            sp = get_store_paths()
+            max_p = data.get("maxPages") or cfg.get("pdfMaxPages", 20)
+            dpi = data.get("dpi") or cfg.get("pdfDpi", 110)
+            res = dsh_sync.render_document_pages(
+                target_path,
+                sp["rendersDir"],
+                pdf_max_pages=max_p,
+                pdf_dpi=dpi,
+            )
+            self._send_json(200, res)
             return
 
         self._send_json(404, {"error": "Not found"})

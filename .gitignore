@@ -5,3 +5,10 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+
+.pytest_cache/
+*.tmp
+*.part
+fl_renders/
+fl_preview/
+file_launcher_*.json

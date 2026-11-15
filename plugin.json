@@ -1,15 +1,17 @@
 {
   "name": "file-launcher",
   "displayName": "File Launcher",
-  "version": "2.3.0",
-  "description": "Click-to-open file results panel for Antigravity: open generated files directly, choose 'Open With' apps (VS Code, Office/WPS, system Open With dialog), or reveal in File Explorer.",
+  "version": "2.4.0",
+  "description": "Codex-style Antigravity file launcher with right-sidebar preview, Source×Type dual filtering, PDF/Office page rendering, cross-conversation chat attachment, anti-compaction pinning, date-based archiving, and safe permanent delete.",
   "author": {
     "name": "ZOU2850"
   },
+  "homepage": "https://github.com/ZOU2850/antigravity-file-launcher",
+  "repository": "https://github.com/ZOU2850/antigravity-file-launcher",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "Open the File Launcher panel to view and launch files from this conversation",
-    "List all files generated in this session and open the latest result",
-    "Show recent workspace and session output files with Open With options"
+    "Open the File Launcher panel to inspect current conversation outputs",
+    "Show all files I sent or @-mentioned in this session",
+    "Help me archive and pin today's deliverable documents"
   ]
 }
