@@ -1,10 +1,10 @@
 {
   "name": "file-launcher",
   "displayName": "File Launcher",
-  "version": "1.0.0",
+  "version": "2.3.0",
   "description": "Click-to-open file results panel for Antigravity: open generated files directly, choose 'Open With' apps (VS Code, Office/WPS, system Open With dialog), or reveal in File Explorer.",
   "author": {
-    "name": "Antigravity Community"
+    "name": "ZOU2850"
   },
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
