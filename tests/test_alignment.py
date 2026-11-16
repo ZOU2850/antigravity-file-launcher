@@ -373,13 +373,31 @@ class TestHttpEndpoints(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertIn(b"app.js?v=2.4.1", html_bytes)
         self.assertIn(b"settingsModal", html_bytes)
+        self.assertIn(b"batchCopyRefBtn", html_bytes)
+        self.assertNotIn(b"chatAttachedBar", html_bytes)
+        self.assertNotIn(b"batchChatBtn", html_bytes)
+        self.assertNotIn("加入对话框".encode("utf-8"), html_bytes)
         st, _, css_bytes = self._req("/styles.css")
         self.assertEqual(st, 200)
         self.assertIn(b".fl-context-menu", css_bytes)
         self.assertIn(b".ref-badge", css_bytes)
+        self.assertIn(b".row-copy-ref-btn", css_bytes)
+        self.assertNotIn(b".chat-attached-bar", css_bytes)
+        self.assertNotIn(b".chat-badge", css_bytes)
         st, _, js_bytes = self._req("/app.js")
         self.assertEqual(st, 200)
         self.assertIn(b"openContextMenu", js_bytes)
+        self.assertIn(b"copyFileReferences", js_bytes)
+        self.assertIn(b"row-copy-ref-btn", js_bytes)
+        for removed_marker in (
+            "加入对话框".encode("utf-8"),
+            "补发气泡".encode("utf-8"),
+            "直接发给 AI".encode("utf-8"),
+            b"injectHostComments",
+            b"addArtifactComment",
+            b"setLanguage",
+        ):
+            self.assertNotIn(removed_marker, js_bytes)
 
         # 2. Settings GET/POST
         st, _, raw = self._req("/api/settings")
@@ -509,6 +527,145 @@ class TestHttpEndpoints(unittest.TestCase):
         with self.assertRaises(HTTPError) as ctx:
             self._req("/api/pdf-image?token=../../etc&page=1")
         self.assertEqual(ctx.exception.code, 404)
+
+    def test_script_generated_docx_discovery_pending_open_and_attach_disabled(self):
+        # 1) 测试通过 run_command + scratch 脚本 + file_capsules.html + fl_preview 产出的 .docx 被捕获，且过滤 file_capsules.html 外壳
+        cid = "ed19a74b-be3e-48ce-b512-cf822f0cf9b5"
+        conv_dir = self.store_dir / "brain" / cid
+        logs_dir = conv_dir / ".system_generated" / "logs"
+        prev_dir = conv_dir / "fl_preview"
+        scratch_dir = conv_dir / "scratch"
+        logs_dir.mkdir(parents=True)
+        prev_dir.mkdir(parents=True)
+        scratch_dir.mkdir(parents=True)
+
+        docx_out = self.work_dir / "final_report.docx"
+        docx_out.write_bytes(b"PK\x03\x04dummy-docx")
+        (conv_dir / "file_capsules.html").write_text(
+            f'<script>const files=[{{name:"final_report.docx",path:{json.dumps(str(docx_out))}}}];</script>',
+            encoding="utf-8",
+        )
+        (conv_dir / "file_capsules.html.metadata.json").write_text('{"Summary":"x"}', encoding="utf-8")
+        (prev_dir / "final_report.md").write_text(
+            f"> 📄 **final_report.docx** 的只读预览　·　原文件：`{docx_out}`\n\n内容",
+            encoding="utf-8",
+        )
+        script_file = scratch_dir / "build.py"
+        script_file.write_text("# helper", encoding="utf-8")
+        t_rec = {
+            "step_index": 5,
+            "type": "PLANNER_RESPONSE",
+            "truncated_fields": ["tool_calls"],
+            "tool_calls": [],
+        }
+        t_full = {
+            "step_index": 5,
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [
+                {"name": "write_file", "args": {"Path": str(script_file), "Content": f'out = r"{docx_out}"'}},
+                {"name": "run_command", "args": {"CommandLine": f'python "{script_file}"'}},
+            ],
+        }
+        (logs_dir / "transcript.jsonl").write_text(json.dumps(t_rec), encoding="utf-8")
+        (logs_dir / "transcript_full.jsonl").write_text(json.dumps(t_full), encoding="utf-8")
+
+        sess_rows = server_main.collect_session_files(self.store_dir, cid, is_current=True)
+        sess_keys = {dsh_sync.path_key(x["path"]): x for x in sess_rows}
+        self.assertIn(dsh_sync.path_key(str(docx_out)), sess_keys)
+        self.assertNotIn(dsh_sync.path_key(str(conv_dir / "file_capsules.html")), sess_keys)
+        self.assertNotIn(dsh_sync.path_key(str(conv_dir / "file_capsules.html.metadata.json")), sess_keys)
+
+        # 2) 验证 /api/attach 返回禁用提示（不再假装 ok: True）
+        st, _, raw = self._req(f"/api/attach?conversationId={cid}&paths={json.dumps([str(docx_out)])}")
+        self.assertEqual(st, 200)
+        attach_res = json.loads(raw)
+        self.assertFalse(attach_res["ok"])
+        self.assertTrue(attach_res.get("disabled"))
+
+        # 3) 验证 sidecar 隐藏时 internal-open 写入 pendingInternalOpen，随后切到 sidecar 打开即刻返还并消费
+        from urllib.parse import quote
+        server_main.write_ipc_state({"lastSidecarVisible": 0.0, "queue": []})
+        st, _, open_raw = self._req(f"/api/internal-open?path={quote(str(docx_out))}&conversationId={cid}")
+        open_res = json.loads(open_raw)
+        self.assertTrue(open_res["ok"])
+        self.assertFalse(open_res["sidecarActive"])
+
+        st, _, state_raw = self._req(f"/api/state?client=sidecar&ver={server_main.SERVER_VER}&visible=1&conversationId={cid}")
+        st_payload = json.loads(state_raw)
+        self.assertTrue(st_payload["pendingInternalOpen"] and st_payload["pendingInternalOpen"]["file"])
+        self.assertEqual(
+            dsh_sync.path_key(st_payload["pendingInternalOpen"]["file"]["path"]),
+            dsh_sync.path_key(str(docx_out)),
+        )
+
+        # 4) 验证 /api/poll-open 按 conversationId 隔离，不误吞其他对话待消费动作
+        server_main.push_ipc_action({"type": "open", "file": {"path": str(docx_out)}, "conversationId": cid})
+        st, _, other_raw = self._req("/api/poll-open?visible=1&wait=0&conversationId=11111111-1111-1111-1111-111111111111")
+        self.assertEqual(json.loads(other_raw)["queue"], [])
+        st, _, own_raw = self._req(f"/api/poll-open?visible=1&wait=0&conversationId={cid}")
+        self.assertEqual(len(json.loads(own_raw)["queue"]), 1)
+
+        # 5) 验证 app.js 仅以官方规范参数调用 toggleAuxPane
+        _, _, js_bytes = self._req("/app.js")
+        js_txt = js_bytes.decode("utf-8")
+        self.assertIn('toggleAuxPane({ tabType: "fileView", uri: side.uri })', js_txt)
+        self.assertNotIn("keepOpen:", js_txt)
+
+        # 6) 验证脚本拆分拼接路径 (Path / 'filename.docx') 与 run_command 标准输出/任务日志中的生成文件均能被捕获，且只读目录扫描不误报
+        split_dir = self.work_dir / "split_out_dir"
+        split_dir.mkdir()
+        split_docx = split_dir / "拆分拼接报告.docx"
+        split_docx.write_bytes(b"PK\x03\x04split")
+        stdout_pdf = split_dir / "命令行输出成品.pdf"
+        stdout_pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        ignored_listing_doc = split_dir / "无关目录列表文件.docx"
+        ignored_listing_doc.write_bytes(b"PK\x03\x04ignored")
+
+        cid2 = "12345678-aaaa-bbbb-cccc-1234567890ab"
+        conv2 = self.store_dir / "brain" / cid2
+        logs2 = conv2 / ".system_generated" / "logs"
+        tasks2 = conv2 / ".system_generated" / "tasks"
+        logs2.mkdir(parents=True)
+        tasks2.mkdir(parents=True)
+        ws_script = self.work_dir / "gen_outside_scratch.py"
+        ws_script.write_text(
+            f"OUT_DIR = Path(r'{split_dir}')\nOUT = OUT_DIR / '拆分拼接报告.docx'\n",
+            encoding="utf-8",
+        )
+        tlog = tasks2 / "task-9.log"
+        tlog.write_text(f"Saved PDF to: {stdout_pdf}\n", encoding="utf-8")
+        steps2 = [
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": f'python "{ws_script}"'}},
+                ],
+            },
+            {
+                "step_index": 2,
+                "type": "GENERIC",
+                "content": f"Command output:\nTask logs are available at: {tlog.as_uri()}\n",
+            },
+            {
+                "step_index": 3,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": f'Get-ChildItem "{split_dir}"'}},
+                ],
+            },
+            {
+                "step_index": 4,
+                "type": "GENERIC",
+                "content": f"Command output:\n    目录: {split_dir}\nMode                 LastWriteTime         Length Name\n-a----        2026/11/16     12:00             10 {ignored_listing_doc}\n",
+            },
+        ]
+        (logs2 / "transcript.jsonl").write_text("\n".join(json.dumps(s) for s in steps2), encoding="utf-8")
+        sess2 = server_main.collect_session_files(self.store_dir, cid2, is_current=True)
+        sess2_keys = {dsh_sync.path_key(x["path"]) for x in sess2}
+        self.assertIn(dsh_sync.path_key(str(split_docx)), sess2_keys)
+        self.assertIn(dsh_sync.path_key(str(stdout_pdf)), sess2_keys)
+        self.assertNotIn(dsh_sync.path_key(str(ignored_listing_doc)), sess2_keys)
 
 
 if __name__ == "__main__":

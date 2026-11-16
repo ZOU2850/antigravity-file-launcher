@@ -86,8 +86,10 @@ CATEGORY_MAP = {
 }
 
 SKIP_DIRS = {
-    "node_modules", ".git", ".hg", ".svn", "__pycache__", ".venv", "venv",
-    "dist", "build", ".next", ".nuxt", ".cache", ".agents", ".agent", ".gemini"
+    "node_modules", ".git", ".hg", ".svn", "__pycache__", ".venv", "venv", ".venv3", "venv3",
+    "dist", "build", "out", "coverage", ".next", ".nuxt", ".cache", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", "site-packages", "vendor", "pods", "target", "obj",
+    "logs", ".agents", ".agent", ".gemini",
 }
 NON_PROJECT_SUBDIRS = SKIP_DIRS | {
     "archived_docs", "pinned_protected_files", "fl_preview", ".fl_preview",
@@ -331,6 +333,8 @@ def perform_batch_action(op, paths, conv_id=""):
         return res
 
     if op in ("attach", "copy_chat_refs"):
+        if op == "attach":
+            return {"ok": False, "disabled": True, "error": "「加入对话框」已下线，请使用「复制引用」并在输入框粘贴 @引用"}
         files = []
         for p in norm_paths:
             side = build_side_uri(p, conv_id)
@@ -339,7 +343,7 @@ def perform_batch_action(op, paths, conv_id=""):
                 item["openUri"] = side.get("uri") or item.get("fileUri") or ""
                 item["sideKind"] = side.get("kind") or "external"
                 files.append(item)
-        return {"ok": True, "op": "attach", "count": len(files), "files": files}
+        return {"ok": True, "op": op, "count": len(files), "files": files}
 
     return {"ok": False, "error": f"未知操作: {op}"}
 
@@ -1076,12 +1080,178 @@ def _resolve_fl_preview_origin(local_path):
     return ""
 
 
+_DELIVERABLE_TEXT_EXT_RE = (
+    r"(?:docx|doc|pptx|ppt|xlsx|xls|xlsm|pdf|csv|tsv|md|markdown|txt|html|htm|png|jpg|jpeg|webp|gif|svg|zip|7z)"
+)
+_ABS_WIN_FILE_RE = re.compile(
+    r'([A-Za-z]:(?:\\\\|\\|/)[^"\'`\r\n<>|*?\x00-\x1f]+?\.' + _DELIVERABLE_TEXT_EXT_RE + r')(?=["\'`\s)\],;>}）]|$)',
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_existing_deliverable_paths_from_text(text, extra_dirs=None, allow_split_join=False):
+    """从命令参数、脚本字面量、命令输出或回复正文中提取磁盘上真实存在的非内部交付文件路径。"""
+    if not text or not isinstance(text, str):
+        return []
+    out = []
+    seen = set()
+
+    def _accept(raw_candidate):
+        if not raw_candidate:
+            return
+        cand = str(raw_candidate).replace("\\\\", "\\").strip()
+        np = dsh_sync.norm_path_str(cand)
+        if not np:
+            return
+        mapped = _resolve_fl_preview_origin(np)
+        if mapped:
+            np = mapped
+        low = np.lower().replace("/", "\\")
+        if "/.user_uploaded/" in low.replace("\\", "/") or _is_internal_ignored_path(np):
+            return
+        k = dsh_sync.path_key(np)
+        if not k or k in seen:
+            return
+        if os.path.isfile(np):
+            seen.add(k)
+            out.append(np)
+
+    for m in re.finditer(r"file:///[^\s)\"'\]>`]+", text, flags=re.IGNORECASE):
+        _accept(file_uri_to_local_path(m.group(0)))
+    for m in _ABS_WIN_FILE_RE.finditer(text):
+        _accept(m.group(1))
+
+    if allow_split_join:
+        # 仅在脚本源码中解析拆分拼接的路径（如 OUT_DIR = Path(r'D:\projects\agv_report'); OUT = OUT_DIR / 'report.docx'）
+        dir_cands = []
+        seen_dirs = set()
+        for d in (extra_dirs or []):
+            nd = dsh_sync.norm_path_str(str(d or ""))
+            if nd and nd.lower() not in seen_dirs and os.path.isdir(nd):
+                seen_dirs.add(nd.lower())
+                dir_cands.append(nd)
+        for m in re.finditer(r'([A-Za-z]:(?:\\\\|\\|/)[^"\'`\r\n<>|*?\x00-\x1f]{2,220})', text):
+            raw_d = m.group(1).replace("\\\\", "\\").rstrip("\\/ ")
+            nd = dsh_sync.norm_path_str(raw_d)
+            if nd and nd.lower() not in seen_dirs and os.path.isdir(nd):
+                seen_dirs.add(nd.lower())
+                dir_cands.append(nd)
+        if dir_cands:
+            fname_re = re.compile(
+                r"""["']([^"'\\/\r\n<>|*?\x00-\x1f]{1,180}\.""" + _DELIVERABLE_TEXT_EXT_RE + r""")["']""",
+                flags=re.IGNORECASE,
+            )
+            for m in fname_re.finditer(text):
+                fname = m.group(1).strip()
+                for d in dir_cands:
+                    _accept(os.path.join(d, fname))
+    return out
+
+
+_SCRIPT_PATH_RE = re.compile(
+    r'([A-Za-z]:(?:\\\\|\\|/)[^"\'`\r\n<>|*?\x00-\x1f]+?\.(?:py|ps1|js|mjs|ts|sh))(?=["\'`\s)\],;>]|$)',
+    flags=re.IGNORECASE,
+)
+_READONLY_CMD_RE = re.compile(
+    r'^\s*(?:get-childitem|gci|dir|ls|select-string|sls|rg|grep|findstr|git\s+(?:status|diff|log|show|branch)|cat|type|get-content|gc)\b',
+    flags=re.IGNORECASE,
+)
+_SAVE_LINE_RE = re.compile(
+    r'(?:saved|wrote|written|generated|exported|rendered|output(?:\s+(?:file|path|to))?|已保存|保存到|已生成|生成到|已导出|导出到|输出到|输出路径|写入到)\b',
+    flags=re.IGNORECASE,
+)
+_DIAG_NOISE_LINE_RE = re.compile(
+    r'(?:^\s*(?:SESS|DISK\s+main\.py|EXTRACTED|diff\s+--git|---|\+\+\+|@@)| \| )',
+    flags=re.IGNORECASE,
+)
+
+
+def _is_deliverable_save_line(line: str) -> bool:
+    if not line or _DIAG_NOISE_LINE_RE.search(line):
+        return False
+    return bool(_SAVE_LINE_RE.search(line))
+
+
+def _extract_deliverables_from_conv_dir(conv_dir):
+    """从会话目录的 file_capsules.html 与 fl_preview/*.md 元数据中还原脚本产出的真实交付文件。"""
+    out = []
+    seen = set()
+
+    def _add(raw_p):
+        np = dsh_sync.norm_path_str(str(raw_p or "").replace("\\\\", "\\"))
+        if not np or _is_internal_ignored_path(np):
+            return
+        low = np.lower().replace("\\", "/")
+        if "/.user_uploaded/" in low:
+            return
+        k = dsh_sync.path_key(np)
+        if not k or k in seen or not os.path.isfile(np):
+            return
+        seen.add(k)
+        out.append(np)
+
+    caps_path = conv_dir / "file_capsules.html"
+    if caps_path.is_file():
+        try:
+            html_txt = caps_path.read_text(encoding="utf-8", errors="ignore")
+            for m in re.finditer(r"""(?:path|target|file)\s*[:=]\s*["']([^"'\r\n]+)["']""", html_txt, flags=re.IGNORECASE):
+                val = m.group(1)
+                if val.lower().startswith("file://"):
+                    val = file_uri_to_local_path(val)
+                if re.match(r"^[A-Za-z]:[\\/]|^/", val):
+                    _add(val)
+            for p in _extract_existing_deliverable_paths_from_text(html_txt):
+                _add(p)
+        except Exception:
+            pass
+
+    preview_dir = conv_dir / "fl_preview"
+    if preview_dir.is_dir():
+        try:
+            for entry in os.scandir(preview_dir):
+                if entry.is_file() and entry.name.lower().endswith(".md"):
+                    origin = _resolve_fl_preview_origin(entry.path)
+                    if origin:
+                        _add(origin)
+        except Exception:
+            pass
+    return out
+
+
+def _load_full_steps_map(conv_folder, wanted_keys):
+    """单趟扫描 transcript_full.jsonl，按 (step_index, type) 取回被截断步骤的完整字段。"""
+    if not wanted_keys:
+        return {}
+    full_path = conv_folder / ".system_generated" / "logs" / "transcript_full.jsonl"
+    if not full_path.is_file():
+        return {}
+    loaded = {}
+    try:
+        with full_path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                key = (rec.get("step_index"), rec.get("type") or rec.get("source") or "")
+                idx_only = (rec.get("step_index"), "*")
+                if key in wanted_keys or idx_only in wanted_keys:
+                    loaded[rec.get("step_index")] = rec
+                    if len(loaded) >= len(wanted_keys):
+                        break
+    except Exception:
+        pass
+    return loaded
+
+
 def _load_full_step_if_truncated(conv_folder, step):
-    """当 transcript.jsonl 对超长 USER_INPUT 截断 content 时，按 step_index 从 transcript_full.jsonl 取回全文。"""
+    """当 transcript.jsonl 对超长步骤截断 content 或 tool_calls 时，从 transcript_full.jsonl 取回完整记录。"""
     if not isinstance(step, dict):
         return step
     trunc = step.get("truncated_fields") or []
-    if "content" not in trunc:
+    if "content" not in trunc and "tool_calls" not in trunc:
         return step
     full_path = conv_folder / ".system_generated" / "logs" / "transcript_full.jsonl"
     if not full_path.is_file():
@@ -1230,6 +1400,11 @@ def collect_ai_created_paths(conv_folder, workspace_roots=None):
 
 def _is_internal_ignored_path(norm_path: str) -> bool:
     lower = norm_path.lower().replace("/", "\\")
+    base = os.path.basename(lower)
+    if base in ("file_capsules.html", "file_capsules.html.metadata.json"):
+        return True
+    if "\\brain\\" in lower and base.endswith(".metadata.json"):
+        return True
     return (
         ".system_generated" in lower
         or "\\builtin\\skills\\" in lower
@@ -1503,10 +1678,14 @@ def collect_session_files(app_data, conv_id, is_current=True, workspace_roots=No
             pass
 
     scan_artifact_dir(conv_dir)
+    for extra_deliv in _extract_deliverables_from_conv_dir(conv_dir):
+        upsert(extra_deliv, "artifact", 9998)
 
     t_path = conv_dir / ".system_generated" / "logs" / "transcript.jsonl"
     if t_path.exists():
         try:
+            raw_steps = []
+            wanted_full = set()
             for line in t_path.read_text(encoding="utf-8", errors="ignore").splitlines():
                 if not line.strip():
                     continue
@@ -1514,6 +1693,19 @@ def collect_session_files(app_data, conv_id, is_current=True, workspace_roots=No
                     step = json.loads(line)
                 except Exception:
                     continue
+                raw_steps.append(step)
+                trunc = step.get("truncated_fields") or []
+                if "content" in trunc or "tool_calls" in trunc:
+                    wanted_full.add((step.get("step_index"), step.get("type") or step.get("source") or ""))
+                    wanted_full.add((step.get("step_index"), "*"))
+            full_map = _load_full_steps_map(conv_dir, wanted_full)
+
+            last_cmd_readonly = False
+            scanned_scripts = set()
+            for step in raw_steps:
+                trunc = step.get("truncated_fields") or []
+                if ("content" in trunc or "tool_calls" in trunc) and step.get("step_index") in full_map:
+                    step = full_map[step.get("step_index")]
                 idx = int(step.get("step_index") or 0)
                 for tc in step.get("tool_calls") or []:
                     if not isinstance(tc, dict):
@@ -1523,12 +1715,76 @@ def collect_session_files(app_data, conv_id, is_current=True, workspace_roots=No
                     for p, src_kind in dsh_sync.extract_paths_from_tool_call(tname, args, workspace_roots=workspace_roots):
                         # 仅对 AI 明确创建或编辑的文件保留 missing 空壳，read 不主动生成 missing 避免噪音
                         upsert(p, src_kind, idx, allow_missing=(src_kind in ("created", "edited")))
+                    tlow = tname.strip().lower()
+                    if tlow == "run_command":
+                        cmd_txt = args.get("CommandLine") or args.get("command") or ""
+                        cmd_segs = [seg.strip() for seg in re.split(r'[;\n&]+', cmd_txt) if seg.strip()]
+                        last_cmd_readonly = bool(cmd_segs) and all(bool(_READONLY_CMD_RE.match(seg)) for seg in cmd_segs)
+                        for p in _extract_existing_deliverable_paths_from_text(cmd_txt, extra_dirs=workspace_roots):
+                            upsert(p, "created", idx)
+                        for sm in _SCRIPT_PATH_RE.finditer(cmd_txt):
+                            sp_cand = dsh_sync.norm_path_str(sm.group(1).replace("\\\\", "\\"))
+                            sk = dsh_sync.path_key(sp_cand)
+                            if sk and sk not in scanned_scripts and os.path.isfile(sp_cand):
+                                scanned_scripts.add(sk)
+                                try:
+                                    if os.path.getsize(sp_cand) <= 262144:
+                                        s_txt = Path(sp_cand).read_text(encoding="utf-8", errors="ignore")
+                                        s_dirs = [os.path.dirname(sp_cand)] + list(workspace_roots or [])
+                                        for p in _extract_existing_deliverable_paths_from_text(
+                                            s_txt, extra_dirs=s_dirs, allow_split_join=True
+                                        ):
+                                            upsert(p, "created", idx)
+                                except Exception:
+                                    pass
+                    elif tlow in {"write_file", "write_to_file", "create_file", "edit_file", "replace_file_content"}:
+                        raw_target = str(args.get("Path") or args.get("path") or args.get("TargetFile") or "").replace("/", "\\")
+                        low_target = raw_target.lower()
+                        is_script = low_target.endswith((".py", ".js", ".mjs", ".ts", ".ps1", ".sh"))
+                        if "\\scratch\\" in low_target or is_script:
+                            body_txt = args.get("Content") or args.get("Replacement") or args.get("CodeContent") or ""
+                            t_dirs = ([os.path.dirname(raw_target)] if os.path.isabs(raw_target) else []) + list(workspace_roots or [])
+                            for p in _extract_existing_deliverable_paths_from_text(
+                                body_txt, extra_dirs=t_dirs, allow_split_join=True
+                            ):
+                                upsert(p, "created", idx)
 
-                if step.get("type") == "PLANNER_RESPONSE" and isinstance(step.get("content"), str):
-                    for m in re.finditer(r"file:///[^\s)\"'\]>`]+", step["content"], flags=re.IGNORECASE):
+                stype = step.get("type") or ""
+                scontent = step.get("content")
+                if stype == "PLANNER_RESPONSE" and isinstance(scontent, str):
+                    for m in re.finditer(r"file:///[^\s)\"'\]>`]+", scontent, flags=re.IGNORECASE):
                         lp = file_uri_to_local_path(m.group(0))
                         if lp:
-                            upsert(lp, "linked", idx)
+                            mapped = _resolve_fl_preview_origin(lp)
+                            upsert(mapped or lp, "linked", idx)
+                    for p in _extract_existing_deliverable_paths_from_text(scontent, extra_dirs=workspace_roots):
+                        upsert(p, "linked", idx)
+                elif stype == "GENERIC" and isinstance(scontent, str):
+                    # 仅从非只读命令的保存/导出提示行中抽取交付路径，跳过诊断输出、目录列表与 read_file 正文
+                    if not last_cmd_readonly and "Showing lines " not in scontent[:200] and "Mode                 LastWriteTime" not in scontent:
+                        cand_lines = [
+                            ln for ln in scontent.splitlines()
+                            if _is_deliverable_save_line(ln)
+                        ]
+                        for lm in re.finditer(r"file:///[^\s)\"'\]>`]+/tasks/task-\d+\.log", scontent, flags=re.IGNORECASE):
+                            log_p = file_uri_to_local_path(lm.group(0))
+                            if log_p and os.path.isfile(log_p):
+                                try:
+                                    if os.path.getsize(log_p) <= 65536:
+                                        log_txt = Path(log_p).read_text(encoding="utf-8", errors="ignore")
+                                        if "Mode                 LastWriteTime" not in log_txt:
+                                            cand_lines.extend(
+                                                ln for ln in log_txt.splitlines()
+                                                if _is_deliverable_save_line(ln)
+                                            )
+                                except Exception:
+                                    pass
+                        if cand_lines:
+                            for p in _extract_existing_deliverable_paths_from_text(
+                                "\n".join(cand_lines), extra_dirs=workspace_roots
+                            ):
+                                if "\\.gemini\\config\\plugins\\" not in p.lower().replace("/", "\\"):
+                                    upsert(p, "created", idx)
         except Exception:
             pass
 
@@ -1576,8 +1832,15 @@ def collect_all_session_files(
         if not conv_dir.exists():
             continue
         t_path = conv_dir / ".system_generated" / "logs" / "transcript.jsonl"
+        caps_path = conv_dir / "file_capsules.html"
+        prev_dir = conv_dir / "fl_preview"
         try:
-            sig = (conv_dir.stat().st_mtime, t_path.stat().st_mtime if t_path.exists() else 0.0)
+            sig = (
+                conv_dir.stat().st_mtime,
+                t_path.stat().st_mtime if t_path.exists() else 0.0,
+                caps_path.stat().st_mtime if caps_path.exists() else 0.0,
+                prev_dir.stat().st_mtime if prev_dir.exists() else 0.0,
+            )
         except Exception:
             sig = None
         ws_roots = list((conv_roots_map or {}).get(cid) or workspace_roots or [])
@@ -2156,7 +2419,7 @@ def build_side_uri(target_path, conv_id=""):
 
 
 def push_ipc_action(action):
-    """把动作（open / attach）压入磁盘队列，并立即唤醒处于可见状态的长轮询 File Launcher 面板。"""
+    """把动作（open）压入磁盘队列，并立即唤醒处于可见状态的长轮询 File Launcher 面板；不可见时保留 pendingInternalOpen。"""
     global ACTION_SEQ
     with QUEUE_COND:
         ipc = read_ipc_state()
@@ -2169,9 +2432,17 @@ def push_ipc_action(action):
         q = [a for a in (ipc.get("queue") or []) if now - float(a.get("ts") or 0) < 60.0]
         q.append(action)
         ipc["queue"] = q[-30:]
-        ipc["pendingInternalOpen"] = None
-        write_ipc_state(ipc)
         vis_active = (now - float(ipc.get("lastSidecarVisible") or 0)) < 20.0
+        if action.get("type") == "open" and action.get("file") and not vis_active:
+            ipc["pendingInternalOpen"] = {
+                "file": action.get("file"),
+                "ts": now,
+                "conversationId": action.get("conversationId") or "",
+                "actionId": aid,
+            }
+        else:
+            ipc["pendingInternalOpen"] = None
+        write_ipc_state(ipc)
         QUEUE_COND.notify_all()
         return vis_active, aid
 
@@ -2773,10 +3044,11 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             pending_doc = None
             with QUEUE_COND:
                 ipc = read_ipc_state()
+                now = time.time()
                 if query.get("client") == "sidecar":
-                    ipc["lastSidecarSeen"] = time.time()
+                    ipc["lastSidecarSeen"] = now
                     if query.get("visible") == "1":
-                        ipc["lastSidecarVisible"] = time.time()
+                        ipc["lastSidecarVisible"] = now
                     ipc["clientVer"] = query.get("ver") or "legacy"
                     if query.get("ver") != SERVER_VER:
                         pending_doc = {
@@ -2785,8 +3057,21 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                                 "name": "正在更新界面...",
                                 "ext": ".docx",
                             },
-                            "ts": time.time(),
+                            "ts": now,
                         }
+                    else:
+                        pend = ipc.get("pendingInternalOpen")
+                        if isinstance(pend, dict) and pend.get("file") and (now - float(pend.get("ts") or 0) < 90.0):
+                            pend_cid = pend.get("conversationId") or ""
+                            if not pend_cid or not conv_id or pend_cid == conv_id:
+                                pending_doc = pend
+                                ipc["pendingInternalOpen"] = None
+                                aid_rem = pend.get("actionId")
+                                if aid_rem:
+                                    ipc["queue"] = [a for a in (ipc.get("queue") or []) if a.get("id") != aid_rem]
+                                    acked = dict(ipc.get("ackedIds") or {})
+                                    acked[aid_rem] = now
+                                    ipc["ackedIds"] = acked
                     write_ipc_state(ipc)
             pdf_ready = bool(dsh_sync.find_executable(["pdfinfo"]) and dsh_sync.find_executable(["pdftoppm"]))
             office_ready = bool(pdf_ready and dsh_sync.find_executable(["soffice", "libreoffice"]))
@@ -2840,76 +3125,13 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "sidecarActive": active, "actionId": action_id, "file": info})
             return
 
-        if route == "/api/attach":
-            conv_q = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
-            _, resolved_conv = resolve_active_conversation(conv_q)
-            use_conv = conv_q if (conv_q and ID_RE.match(conv_q)) else resolved_conv
-            raw_paths = query.get("paths") or query.get("path") or ""
-            try:
-                paths = json.loads(raw_paths) if raw_paths.startswith("[") else [p for p in raw_paths.split("|") if p]
-            except Exception:
-                paths = [raw_paths] if raw_paths else []
-            res = perform_batch_action("attach", paths, use_conv)
-            files = res.get("files") or []
-            if not res.get("ok") or not files:
-                self._send_json(200, {"ok": False, "error": res.get("error") or "未找到有效文件"})
-                return
-            cfg = load_user_config()
-            app_data, _ = resolve_active_conversation(use_conv)
-            real_projects, _, conv_meta_map = load_sidebar_db_data(app_data, use_conv, None)
-            local_dir_roots = discover_local_dir_roots(cfg)
-            conv_project_map = infer_conv_project_map(app_data, real_projects)
-            apps = detect_installed_apps(cfg.get("customApps"))
-            for item in files:
-                tag_file_project(
-                    item,
-                    real_projects,
-                    conv_project_map=conv_project_map,
-                    active_conv_id=use_conv,
-                    local_dir_roots=local_dir_roots,
-                    conv_meta_map=conv_meta_map,
-                )
-                item["matchedApps"] = get_matched_apps_for_ext(item.get("ext", ""), apps)
-            chat_attached = record_chat_attached(use_conv, files)
-            active, action_id = push_ipc_action({"type": "attach", "files": files, "conversationId": use_conv})
-            append_embed_log(f"attach origin={self.headers.get('Origin')} count={len(files)} active={active} aid={action_id}")
+        if route in ("/api/attach", "/api/attach-record"):
             self._send_json(200, {
-                "ok": True,
-                "sidecarActive": active,
-                "actionId": action_id,
-                "count": len(files),
-                "files": files,
-                "chatAttachedFiles": chat_attached,
+                "ok": False,
+                "disabled": True,
+                "error": "「加入对话框」已下线，请使用「复制引用」并在输入框粘贴 @引用 发送",
+                "chatAttachedFiles": [],
             })
-            return
-
-        if route == "/api/attach-record":
-            conv_q = query.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
-            _, resolved_conv = resolve_active_conversation(conv_q)
-            use_conv = conv_q if (conv_q and ID_RE.match(conv_q)) else resolved_conv
-            raw_paths = query.get("paths") or query.get("path") or ""
-            try:
-                paths = json.loads(raw_paths) if raw_paths.startswith("[") else [p for p in raw_paths.split("|") if p]
-            except Exception:
-                paths = [raw_paths] if raw_paths else []
-            res = perform_batch_action("attach", paths, use_conv)
-            files = res.get("files") or []
-            cfg = load_user_config()
-            app_data, _ = resolve_active_conversation(use_conv)
-            real_projects, _, conv_meta_map = load_sidebar_db_data(app_data, use_conv, None)
-            local_dir_roots = discover_local_dir_roots(cfg)
-            conv_project_map = infer_conv_project_map(app_data, real_projects)
-            for item in files:
-                tag_file_project(
-                    item,
-                    real_projects,
-                    conv_project_map=conv_project_map,
-                    active_conv_id=use_conv,
-                    local_dir_roots=local_dir_roots,
-                    conv_meta_map=conv_meta_map,
-                )
-            chat_attached = record_chat_attached(use_conv, files)
-            self._send_json(200, {"ok": True, "count": len(files), "files": files, "chatAttachedFiles": chat_attached})
             return
 
         if route == "/api/attached":
@@ -2992,18 +3214,28 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
 
         if route == "/api/poll-open":
             visible = query.get("visible") == "1"
+            poll_conv = (query.get("conversationId") or "").strip()
             try:
                 wait_sec = min(max(float(query.get("wait") or "0"), 0.0), 20.0)
             except Exception:
                 wait_sec = 0.0
             deadline = time.time() + wait_sec
+
+            def _match_action(act, now_ts):
+                if now_ts - float(act.get("ts") or 0) >= 60.0:
+                    return False
+                acid = (act.get("conversationId") or "").strip()
+                if not acid or not poll_conv:
+                    return True
+                return acid == poll_conv
+
             with QUEUE_COND:
                 ipc = read_ipc_state()
                 now = time.time()
                 ipc["lastSidecarSeen"] = now
                 if visible:
                     ipc["lastSidecarVisible"] = now
-                    queue = [a for a in (ipc.get("queue") or []) if now - float(a.get("ts") or 0) < 60.0]
+                    queue = [a for a in (ipc.get("queue") or []) if _match_action(a, now)]
                 else:
                     queue = []
 
@@ -3016,7 +3248,7 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                         QUEUE_COND.wait(timeout=rem)
                         ipc = read_ipc_state()
                         now = time.time()
-                        queue = [a for a in (ipc.get("queue") or []) if now - float(a.get("ts") or 0) < 60.0]
+                        queue = [a for a in (ipc.get("queue") or []) if _match_action(a, now)]
                         if queue:
                             break
                 elif not visible and wait_sec > 0:
@@ -3032,8 +3264,16 @@ class SidecarRequestHandler(BaseHTTPRequestHandler):
                 ipc["lastSidecarSeen"] = now
                 if visible:
                     ipc["lastSidecarVisible"] = now
-                    ipc["queue"] = []
-                    ipc["pendingInternalOpen"] = None
+                    consumed_ids = {a.get("id") for a in queue if a.get("id")}
+                    ipc["queue"] = [
+                        a for a in (ipc.get("queue") or [])
+                        if now - float(a.get("ts") or 0) < 60.0 and a.get("id") not in consumed_ids
+                    ]
+                    pend = ipc.get("pendingInternalOpen")
+                    if isinstance(pend, dict):
+                        pend_cid = (pend.get("conversationId") or "").strip()
+                        if not pend_cid or not poll_conv or pend_cid == poll_conv:
+                            ipc["pendingInternalOpen"] = None
                 else:
                     ipc["lastSidecarVisible"] = 0.0
                 write_ipc_state(ipc)

@@ -61,15 +61,8 @@
     }
   } catch (e) {}
 
-  let LAST_THEME_MSG_TS = 0;
-  let HOST_UUC_READY_TS = 0;
-
   window.addEventListener("message", (event) => {
     if (event.data && event.data.type === "theme-change") {
-      LAST_THEME_MSG_TS = Date.now();
-      if (isRealSidecarVisible()) {
-        HOST_UUC_READY_TS = LAST_THEME_MSG_TS;
-      }
       if (currentThemeMode === "host") {
         setTimeout(() => applyThemeMode("host"), 0);
       }
@@ -123,41 +116,71 @@
   const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".tif", ".tiff", ".avif"]);
   const OFFICE_PAGE_EXTS = new Set([".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".odt", ".odp", ".ods", ".rtf"]);
 
-  const I18N = {
-    zh: {
-      scopeLabel: "隔离范围",
-      tabSession: "本次产出",
-      tabSent: "我发送的",
-      tabPinned: "★ 收藏保留",
-      tabRecent: "最近项目",
-      select: "选择",
-      exitSelect: "退出选择",
-      filterBtn: "筛选 ▾",
-      archivedBtn: "📦 已归档",
-      searchPlaceholder: "搜索文件名、路径、后缀或类型...",
-    },
-    en: {
-      scopeLabel: "Scope",
-      tabSession: "Session",
-      tabSent: "Sent",
-      tabPinned: "★ Pinned",
-      tabRecent: "Workspace",
-      select: "Select",
-      exitSelect: "Done",
-      filterBtn: "Filter ▾",
-      archivedBtn: "📦 Archived",
-      searchPlaceholder: "Search file name, path, ext...",
-    },
-  };
-
   const APP_VER = "2.4.1";
-  const MOUNT_AT = Date.now();
-  let LAST_VISIBLE_AT = 0;
   let LAST_AUTO_SYNC_AT = 0;
-  let wasRealVisible = false;
   let pollAbortCtrl = null;
   let stateAbortCtrl = null;
   let autoRefreshTimer = null;
+  const comfortTimers = new WeakMap();
+
+  function stopComfortLoader(targetEl) {
+    if (!targetEl) return;
+    const prev = comfortTimers.get(targetEl);
+    if (prev) {
+      clearInterval(prev);
+      comfortTimers.delete(targetEl);
+    }
+  }
+
+  function renderComfortLoadingHtml(mode, elapsedMs, baselineMs) {
+    const safeElapsed = Math.max(0, Number(elapsedMs) || 0);
+    const base = Math.max(900, Number(baselineMs) || 2200);
+    const secStr = (safeElapsed / 1000).toFixed(1);
+    const estLow = Math.max(1, Math.round((base * 0.8) / 1000));
+    const estHigh = Math.max(estLow + 1, Math.ceil((base * 1.4) / 1000));
+    const remainSec = Math.max(1, Math.ceil((base * 1.15 - safeElapsed) / 1000));
+    const overBudget = safeElapsed > base * 1.15;
+    let title = "正在为您整理对话产出与项目文件，请稍候…";
+    if (mode === "viewer") {
+      if (safeElapsed >= 6000) title = "文件体量较大，正在努力排版收尾，请再多等几秒…";
+      else if (safeElapsed >= 2500) title = "文档内容较丰富，正在加速转换版式中，不用着急…";
+      else title = "正在贴心加载文档预览，马上就能查看…";
+    } else {
+      if (safeElapsed >= 6000) title = "项目与历史记录较多，正在全力收尾整理，请再给一点耐心…";
+      else if (safeElapsed >= 2500) title = "文件较多，正在加快扫描并对齐关联项目，很快就好…";
+    }
+    const eta = overBudget
+      ? `已等待 ${secStr} 秒 · 资料较多，正在收尾呈现…`
+      : `已等待 ${secStr} 秒 · 预计共需 ${estLow}–${estHigh} 秒（约剩 ${remainSec} 秒）`;
+    const pct = overBudget
+      ? Math.min(94, 78 + Math.round((safeElapsed - base * 1.15) / 800))
+      : Math.min(82, Math.max(12, Math.round((safeElapsed / base) * 78)));
+    return `
+      <div class="empty-box fl-loading-box" role="status">
+        <div class="fl-loading-head">
+          <span class="fl-spinner" aria-hidden="true"></span>
+          <span class="fl-loading-title">${esc(title)}</span>
+        </div>
+        <div class="fl-loading-track" aria-hidden="true"><div class="fl-loading-fill" style="width:${pct}%"></div></div>
+        <p class="fl-loading-eta">${esc(eta)}</p>
+        <p class="fl-loading-hint">就绪后会自动展示，请放心稍等片刻。</p>
+      </div>`;
+  }
+
+  function startComfortLoader(targetEl, mode, baselineMs) {
+    if (!targetEl) return;
+    stopComfortLoader(targetEl);
+    const startedAt = Date.now();
+    targetEl.innerHTML = renderComfortLoadingHtml(mode, 0, baselineMs);
+    const timer = setInterval(() => {
+      if (!targetEl.isConnected || !targetEl.querySelector(".fl-loading-box")) {
+        stopComfortLoader(targetEl);
+        return;
+      }
+      targetEl.innerHTML = renderComfortLoadingHtml(mode, Date.now() - startedAt, baselineMs);
+    }, 250);
+    comfortTimers.set(targetEl, timer);
+  }
 
   const state = {
     tab: "session",
@@ -207,12 +230,10 @@
     pinnedFiles: [],
     archivedFiles: [],
     recentFiles: [],
-    chatAttachedFiles: [],
     collapsedGroups: new Set(),
     collapsedSubGroups: new Set(),
     initCollapsedApplied: false,
     activeInternalDoc: null,
-    attachedPaths: new Set(),
     // 增强预览状态
     previewRenderMode: "auto", // "pdf" | "html" | "image"
     pdfZoom: (() => {
@@ -240,38 +261,7 @@
   }
 
   function updateVisibilityTimestamp() {
-    const vis = isRealSidecarVisible();
-    if (vis && !wasRealVisible) {
-      LAST_VISIBLE_AT = Date.now();
-      if (LAST_THEME_MSG_TS >= LAST_VISIBLE_AT - 200) {
-        HOST_UUC_READY_TS = Math.max(HOST_UUC_READY_TS, LAST_THEME_MSG_TS);
-      }
-    }
-    if (!vis) HOST_UUC_READY_TS = 0;
-    wasRealVisible = vis;
-    return vis;
-  }
-
-  async function waitForHostUucReady() {
-    const baseTs = Math.max(MOUNT_AT, LAST_VISIBLE_AT || MOUNT_AT);
-    const deadline = baseTs + 750;
-    while (isRealSidecarVisible()) {
-      const hostSignaled =
-        HOST_UUC_READY_TS >= baseTs ||
-        (LAST_THEME_MSG_TS >= baseTs - 150 && Date.now() - baseTs >= 120);
-      if (hostSignaled || Date.now() >= deadline) {
-        await new Promise((r) => {
-          if (typeof requestAnimationFrame === "function") {
-            requestAnimationFrame(() => requestAnimationFrame(r));
-          } else {
-            setTimeout(r, 32);
-          }
-        });
-        return true;
-      }
-      await new Promise((r) => setTimeout(r, 60));
-    }
-    return false;
+    return isRealSidecarVisible();
   }
   updateVisibilityTimestamp();
 
@@ -401,13 +391,16 @@
   }
 
   function formatMentionRef(f) {
-    const p = String((f && f.path) || "");
+    if (!f) return "";
+    const p = String(f.path || "").trim();
     if (!p) return "";
+    const name = String(f.name || "").trim();
+    if (name) return `@${name}（${p}）`;
     return /\s/.test(p) ? `@"${p}"` : `@${p}`;
   }
 
   function formatChatRefsText(list) {
-    return (list || []).map((f) => `@${f.name}（${f.path}）`).join("\n");
+    return (list || []).map((f) => formatMentionRef(f)).filter(Boolean).join("\n");
   }
 
   async function copyTextToClipboard(text) {
@@ -431,6 +424,26 @@
     } catch (e) {
       return false;
     }
+  }
+
+  async function copyFileReferences(files) {
+    const list = (files || []).filter((f) => f && f.path);
+    if (!list.length) {
+      showToast("请先选择或勾选至少一个文件");
+      return false;
+    }
+    const text = formatChatRefsText(list);
+    const ok = await copyTextToClipboard(text);
+    if (ok) {
+      showToast(
+        list.length === 1
+          ? `已复制「${list[0].name}」引用，请到聊天框 Ctrl+V 发送`
+          : `已复制 ${list.length} 项引用，请到聊天框 Ctrl+V 发送`
+      );
+    } else {
+      showToast("复制引用失败，请尝试右键复制完整路径");
+    }
+    return ok;
   }
 
   async function copyImageToClipboard(filePath) {
@@ -694,154 +707,18 @@
       showToast("该格式已用电脑默认软件打开");
       return;
     }
-    openInternalReader(f);
     const ui = window.sidecar && window.sidecar.ui;
     if (side.uri && ui && typeof ui.toggleAuxPane === "function") {
-      ui.toggleAuxPane({ tabType: "fileView", uri: side.uri, keepOpen: true, background: false });
-      showToast(side.kind === "mirror" ? `已在侧边栏打开 ${f.name}（只读预览）` : `已在侧边栏打开 ${f.name}`);
-      return;
+      try {
+        const res = await ui.toggleAuxPane({ tabType: "fileView", uri: side.uri });
+        if (!res || !res.isError) {
+          showToast(side.kind === "mirror" ? `已在侧边栏打开 ${f.name}（只读预览）` : `已在侧边栏打开 ${f.name}`);
+          return;
+        }
+      } catch (e) {}
     }
+    await openInternalReader(f);
     showToast(`已在面板中打开 ${f.name}`);
-  }
-
-  // ---------- 加入对话框 & 宿主 Comment Pill 注入 ----------
-  let lastLocalAttachedMutAt = 0;
-  const lastInjectedAtByPath = new Map();
-  const HOST_INJECT_COOLDOWN_MS = 1200;
-
-  function syncAttachedPathSet() {
-    state.attachedPaths = new Set((state.chatAttachedFiles || []).map((x) => String(x.path || "").toLowerCase()).filter(Boolean));
-  }
-
-  async function sendAttachedToAI(files) {
-    const list = (files && files.length ? files : state.chatAttachedFiles) || [];
-    if (!list.length) {
-      showToast("当前对话引用栏为空");
-      return;
-    }
-    const msg = "请结合以下我加入对话的文件继续协助：\n" + formatChatRefsText(list);
-    const agent = window.sidecar && window.sidecar.agent;
-    if (agent && typeof agent.sendMessage === "function") {
-      try {
-        await agent.sendMessage(msg, getConversationId());
-        showToast(`已将 ${list.length} 个引用文件直接发送给 AI`);
-        return;
-      } catch (e) {}
-    }
-    const copied = await copyTextToClipboard(msg);
-    showToast(copied ? "已复制引用内容到剪贴板，请直接 Ctrl+V 发送给 AI" : "当前环境不支持直接发送，请手动粘贴路径");
-  }
-
-  async function injectHostComments(files, quiet, force) {
-    const list = (files || []).filter((f) => f && f.path);
-    if (!list.length) return 0;
-    const ui = window.sidecar && window.sidecar.ui;
-    if (!isRealSidecarVisible() || !ui || typeof ui.addArtifactComment !== "function") {
-      if (!quiet) showToast("当前侧边栏未展开，请先点「File Launcher」或使用「🚀 直接发给 AI / 📋 复制引用」");
-      return 0;
-    }
-    let addedHost = 0;
-    let skipped = 0;
-    const now = Date.now();
-    for (const f of list) {
-      const lp = String(f.path || "").toLowerCase();
-      const prevAt = lastInjectedAtByPath.get(lp) || 0;
-      if (!force && now - prevAt < HOST_INJECT_COOLDOWN_MS) {
-        skipped++;
-        continue;
-      }
-      try {
-        let targetUri = f.openUri || "";
-        if (!targetUri) {
-          const side = await resolveSide(f);
-          targetUri = (side && side.uri) || "";
-        }
-        if (!targetUri) targetUri = f.fileUri;
-        const scopeLabel = f.convTitle || f.projectName || "";
-        const scopeTag = scopeLabel ? ` [${scopeLabel}]` : "";
-        const commentText = `已引用${scopeTag}：请结合文件「${f.name}」内容回答`;
-        const titleText = scopeLabel && !f.isCurrentConv ? `${f.name} · ${scopeLabel}` : f.name;
-        ui.addArtifactComment({
-          uri: targetUri,
-          comment: commentText,
-          selection: { content: `${f.name}${scopeTag}` },
-          pageTitle: titleText,
-        });
-        lastInjectedAtByPath.set(lp, Date.now());
-        addedHost++;
-        if (list.length > 1) await new Promise((r) => setTimeout(r, 15));
-      } catch (e) {}
-    }
-    if (!quiet) {
-      if (addedHost > 0) {
-        showToast(`已写入/补发 ${addedHost} 个宿主「Comment 气泡」（在输入框气泡内点删除图标可移除）`);
-      } else if (skipped > 0) {
-        showToast("刚刚已发送过气泡注入请求，请稍等片刻");
-      }
-    }
-    return addedHost;
-  }
-
-  async function attachToChat(files, skipServerRecord) {
-    const list = (files || []).filter((f) => f && f.path);
-    if (!list.length) {
-      showToast("请先勾选至少一个文件");
-      return;
-    }
-    lastLocalAttachedMutAt = Date.now();
-    const convId = getConversationId();
-    if (!skipServerRecord) {
-      try {
-        const qPaths = JSON.stringify(list.map((f) => f.path));
-        const r = await sidecarFetch("/api/attach-record?conversationId=" + encodeURIComponent(convId) + "&paths=" + encodeURIComponent(qPaths));
-        const d = await r.json();
-        if (d && d.ok && Array.isArray(d.chatAttachedFiles)) {
-          state.chatAttachedFiles = d.chatAttachedFiles;
-          syncAttachedPathSet();
-        }
-      } catch (e) {}
-    } else {
-      const existing = [...(state.chatAttachedFiles || [])];
-      const byLow = new Set(existing.map((x) => String(x.path || "").toLowerCase()));
-      list.forEach((f) => {
-        if (!byLow.has(f.path.toLowerCase())) {
-          existing.unshift(f);
-          byLow.add(f.path.toLowerCase());
-        }
-      });
-      state.chatAttachedFiles = existing;
-      syncAttachedPathSet();
-    }
-
-    const addedHost = await injectHostComments(list, true, !!skipServerRecord);
-    showToast(
-      addedHost > 0
-        ? `已注入 ${addedHost} 个「Comment 引用气泡」到输入框上方`
-        : `已把 ${list.length} 个文件加入本对话引用栏`
-    );
-    renderChatAttachedBar();
-    renderList();
-  }
-
-  async function detachFromChat(filePath, clearAll) {
-    try {
-      lastLocalAttachedMutAt = Date.now();
-      const convId = getConversationId();
-      if (clearAll) lastInjectedAtByPath.clear();
-      else if (filePath) lastInjectedAtByPath.delete(String(filePath).toLowerCase());
-      const url = clearAll
-        ? "/api/detach?op=clear&conversationId=" + encodeURIComponent(convId)
-        : "/api/detach?conversationId=" + encodeURIComponent(convId) + "&path=" + encodeURIComponent(filePath);
-      const res = await sidecarFetch(url);
-      const data = await res.json();
-      if (data && data.ok) {
-        state.chatAttachedFiles = data.chatAttachedFiles || [];
-        syncAttachedPathSet();
-        renderChatAttachedBar();
-        renderList();
-        showToast("已移出对话引用栏");
-      }
-    } catch (e) {}
   }
 
   function findFileByPath(p) {
@@ -851,7 +728,6 @@
       state.pinnedFiles,
       state.archivedFiles,
       state.recentFiles,
-      state.chatAttachedFiles,
     ];
     for (const pool of pools) {
       const hit = (pool || []).find((x) => x.path === p);
@@ -958,11 +834,17 @@
     const side = await resolveSide(f);
     const ui = window.sidecar && window.sidecar.ui;
     if (side.uri && ui && typeof ui.toggleAuxPane === "function") {
-      ui.toggleAuxPane({ tabType: "fileView", uri: side.uri, keepOpen: true, background: false });
-      showToast(`已在侧边栏打开 ${f.name}`);
-    } else {
-      triggerExternalOpen(f.path, "default", "");
+      try {
+        const res = await ui.toggleAuxPane({ tabType: "fileView", uri: side.uri });
+        if (!res || !res.isError) {
+          if (el("docModal")) el("docModal").classList.add("hidden");
+          state.activeInternalDoc = null;
+          showToast(`已在侧边栏打开 ${f.name}`);
+          return;
+        }
+      } catch (e) {}
     }
+    triggerExternalOpen(f.path, "default", "");
   });
 
   async function openInternalReader(f) {
@@ -979,7 +861,7 @@
     el("docBanner").classList.add("hidden");
     el("docBanner").textContent = "";
     el("docTopTitle").textContent = f.name;
-    el("docContent").innerHTML = '<div class="empty-box">正在加载内容...</div>';
+    startComfortLoader(el("docContent"), "viewer", 2400);
     updateDocPrevNextButtons();
 
     const docMenu = el("docMenuDrop");
@@ -991,8 +873,8 @@
       .join("");
     docMenu.innerHTML = `
       ${isImg ? `<button class="menu-item" data-mode="copy_image"><span>复制图片</span></button>` : ""}
+      <button class="menu-item" data-mode="copy_mention"><span>@ 复制引用</span></button>
       <button class="menu-item" data-mode="copy_path"><span>复制完整路径</span></button>
-      <button class="menu-item" data-mode="copy_mention"><span>复制 @ 引用</span></button>
       <div class="menu-divider"></div>
       ${appBtns ? `<div class="menu-section-label">匹配的应用</div>${appBtns}<div class="menu-divider"></div>` : ""}
       <button class="menu-item" data-mode="reveal"><span>文件资源管理器</span></button>
@@ -1008,7 +890,7 @@
         } else if (mode === "copy_path") {
           copyTextToClipboard(f.path).then((ok) => showToast(ok ? "已复制完整路径" : "复制失败"));
         } else if (mode === "copy_mention") {
-          copyTextToClipboard(formatMentionRef(f)).then((ok) => showToast(ok ? "已复制 @ 引用" : "复制失败"));
+          copyFileReferences([f]);
         } else {
           triggerExternalOpen(f.path, mode, btn.getAttribute("data-app") || "");
         }
@@ -1138,8 +1020,7 @@
     const bar = el("compositeBar");
     const selectBtn = el("selectModeBtn");
     selectBtn.classList.toggle("active", state.selectMode);
-    const dict = I18N[(state.config && state.config.language) || "zh"] || I18N.zh;
-    selectBtn.querySelector("span").textContent = state.selectMode ? dict.exitSelect : dict.select;
+    selectBtn.querySelector("span").textContent = state.selectMode ? "退出选择" : "选择";
     if (!state.selectMode) {
       bar.classList.add("hidden");
       return;
@@ -1462,7 +1343,6 @@
 
     state.contextMenuFile = f;
     state.contextMenuFocusIdx = -1;
-    const attachedFlag = state.attachedPaths.has(String(f.path || "").toLowerCase());
     const ext = String(f.ext || "").toLowerCase();
     const isImg = IMAGE_EXTS.has(ext) && !f.missing;
     const matched = Array.isArray(f.matchedApps) ? f.matchedApps : [];
@@ -1478,8 +1358,8 @@
           <span class="menu-tag">清理</span>
         </button>
         <div class="menu-divider"></div>
+        <button class="menu-item" data-act="copy_mention"><span>@ 复制引用</span></button>
         <button class="menu-item" data-act="copy_path"><span>复制原完整路径</span></button>
-        <button class="menu-item" data-act="copy_mention"><span>复制 @ 引用</span></button>
       `);
     } else {
       if (!f.isDir) {
@@ -1508,11 +1388,8 @@
       }
       itemsHtml.push(`<div class="menu-divider"></div>`);
       itemsHtml.push(`
-        <button class="menu-item" data-act="copy_chat">
-          <span>${attachedFlag ? "💬 移出对话框" : "💬 加入对话框"}</span>
-        </button>
+        <button class="menu-item" data-act="copy_mention"><span>@ 复制引用</span></button>
         <button class="menu-item" data-act="copy_path"><span>📋 复制完整路径</span></button>
-        <button class="menu-item" data-act="copy_mention"><span>@ 复制 @ 引用</span></button>
       `);
       if (isImg) {
         itemsHtml.push(`<button class="menu-item" data-act="copy_image"><span>🖼 复制图片</span></button>`);
@@ -1543,7 +1420,7 @@
             itemsHtml.push(`
               <button class="menu-item" data-act="open_app" data-app="${esc(a.id)}">
                 <span>${esc(a.name)}</span>
-                ${isDef ? `<span class="menu-item-subtag">✓ 后缀默认</span>` : `<span class="menu-tag" data-set-def="${esc(a.id)}" title="按住 Alt 点击或点右侧设为默认">打开</span>`}
+                ${isDef ? `<span class="menu-item-subtag">✓ 后缀默认</span>` : `<span class="menu-tag" data-set-def="${esc(a.id)}" title="点击设为该后缀默认程序（也可按住 Alt 点击应用名）">设为默认</span>`}
               </button>
             `);
           });
@@ -1592,17 +1469,16 @@
         else if (act === "side_open") openInSidePane(target);
         else if (act === "open_folder") openFolderAction(target.path);
         else if (act === "reveal_archive" && target.archiveInfo?.archivePath) openFolderAction(target.archiveInfo.archivePath);
-        else if (act === "copy_chat") {
-          if (state.attachedPaths.has(String(target.path || "").toLowerCase())) detachFromChat(target.path, false);
-          else attachToChat([target]);
-        } else if (act === "copy_path") copyTextToClipboard(target.path).then((ok) => showToast(ok ? "已复制完整路径" : "复制失败"));
-        else if (act === "copy_mention") copyTextToClipboard(formatMentionRef(target)).then((ok) => showToast(ok ? "已复制 @ 引用" : "复制失败"));
+        else if (act === "copy_path") copyTextToClipboard(target.path).then((ok) => showToast(ok ? "已复制完整路径" : "复制失败"));
+        else if (act === "copy_mention") copyFileReferences([target]);
         else if (act === "copy_image") copyImageToClipboard(target.path);
         else if (act === "pin_toggle") executeBatchAction(target.isPinned ? "unpin" : "pin", [target.path]);
         else if (act === "archive_toggle") executeBatchAction(target.isArchived ? "unarchive" : "archive", [target.path]);
         else if (act === "open_default") triggerExternalOpen(target.path, "default", "");
-        else if (act === "open_app") triggerExternalOpen(target.path, "app", appId, Boolean(e.altKey));
-        else if (act === "open_with_dialog") triggerExternalOpen(target.path, "open_with_dialog", "");
+        else if (act === "open_app") {
+          const setDef = Boolean(e.altKey) || Boolean(e.target && e.target.closest && e.target.closest("[data-set-def]"));
+          triggerExternalOpen(target.path, "app", appId, setDef);
+        } else if (act === "open_with_dialog") triggerExternalOpen(target.path, "open_with_dialog", "");
         else if (act === "forget") forgetPathsAction([target.path]);
         else if (act === "delete_perm") openDeleteConfirmModal([target.path]);
       });
@@ -1645,7 +1521,6 @@
       ? `<span class="sel-check ${isSelected ? "checked" : ""}" data-act="toggle-select">${isSelected ? "✓" : ""}</span>`
       : `<button class="star-btn ${f.isPinned ? "pinned" : ""}" data-act="toggle-pin" title="${f.isPinned ? "已收藏（防压缩保护中），点击取消" : "收藏此文件（防止上下文压缩丢失）"}">${f.isPinned ? "★" : "☆"}</button>`;
 
-    const attachedFlag = state.attachedPaths.has(String(f.path || "").toLowerCase());
     const showProjBadge =
       f.projectName &&
       (state.activeProjectId === "all" || (state.activeProjectId === "scope:conv" && String(f.projectId || "").startsWith("proj:")));
@@ -1660,8 +1535,7 @@
       (showSourceBadge ? `<span class="source-badge ${esc(srcCls)}">${esc(f.sourceLabel)}</span>` : "") +
       (showProjBadge ? `<span class="proj-tag" title="所属项目">${esc(f.projectName)}</span>` : "") +
       (f.isPinned ? `<span class="pin-badge" title="防上下文压缩保护中">★防压缩</span>` : "") +
-      (f.isArchived ? `<span class="arch-badge">已归档</span>` : "") +
-      (attachedFlag ? `<span class="chat-badge" title="已加入对话框">已加入对话</span>` : "");
+      (f.isArchived ? `<span class="arch-badge">已归档</span>` : "");
 
     const clickTitle = state.selectMode
       ? "点击勾选/取消勾选"
@@ -1680,13 +1554,24 @@
           <div class="item-sub">${esc(subParts.join(" · "))}</div>
         </div>
       </div>
-      <div class="open-with-wrap">
-        <button class="open-with-btn" data-act="toggle-menu" title="打开方式与文件操作（或直接右键此行）">
-          <span>${f.missing ? "操作" : "打开方式"}</span>
-          <svg viewBox="0 0 24 24" class="svg-caret"><path d="m6 9 6 6 6-6"/></svg>
-        </button>
+      <div class="row-actions">
+        ${f.missing ? "" : `<button class="row-copy-ref-btn" data-act="copy-ref" title="复制 @ 引用（到聊天框 Ctrl+V 发送即可）">复制引用</button>`}
+        <div class="open-with-wrap">
+          <button class="open-with-btn" data-act="toggle-menu" title="打开方式与文件操作（或直接右键此行）">
+            <span>${f.missing ? "操作" : "打开方式"}</span>
+            <svg viewBox="0 0 24 24" class="svg-caret"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+        </div>
       </div>
     `;
+
+    const copyRefBtn = item.querySelector('[data-act="copy-ref"]');
+    if (copyRefBtn) {
+      copyRefBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        copyFileReferences([f]);
+      });
+    }
 
     const pinBtn = item.querySelector('[data-act="toggle-pin"]');
     if (pinBtn) {
@@ -1899,89 +1784,6 @@
     );
   }
 
-  function renderChatAttachedBar() {
-    const bar = el("chatAttachedBar");
-    if (!bar) return;
-    const items = state.chatAttachedFiles || [];
-    if (!items.length) {
-      bar.classList.add("hidden");
-      bar.innerHTML = "";
-      return;
-    }
-    bar.classList.remove("hidden");
-    bar.innerHTML = "";
-
-    const top = document.createElement("div");
-    top.className = "chat-attached-top";
-
-    const head = document.createElement("span");
-    head.className = "chat-attached-head";
-    head.textContent = `💬 已加入本对话 (${items.length}) · 支持跨对话/跨目录引用`;
-    top.appendChild(head);
-
-    const acts = document.createElement("div");
-    acts.className = "chat-attached-actions";
-
-    const sendBtn = document.createElement("button");
-    sendBtn.type = "button";
-    sendBtn.className = "chat-act-btn primary";
-    sendBtn.textContent = "🚀 直接发给 AI";
-    sendBtn.addEventListener("click", () => sendAttachedToAI(items));
-    acts.appendChild(sendBtn);
-
-    const copyBtn = document.createElement("button");
-    copyBtn.type = "button";
-    copyBtn.className = "chat-act-btn";
-    copyBtn.textContent = "📋 复制引用";
-    copyBtn.addEventListener("click", async () => {
-      const ok = await copyTextToClipboard(formatChatRefsText(items));
-      showToast(ok ? `已复制 ${items.length} 个文件引用，请 Ctrl+V 粘贴到对话框` : "复制失败");
-    });
-    acts.appendChild(copyBtn);
-
-    const hostBtn = document.createElement("button");
-    hostBtn.type = "button";
-    hostBtn.className = "chat-act-btn";
-    hostBtn.textContent = "🔄 补发气泡";
-    hostBtn.addEventListener("click", () => injectHostComments(items, false, true));
-    acts.appendChild(hostBtn);
-
-    const clearBtn = document.createElement("button");
-    clearBtn.type = "button";
-    clearBtn.className = "chat-act-btn";
-    clearBtn.textContent = "清空";
-    clearBtn.addEventListener("click", () => detachFromChat("", true));
-    acts.appendChild(clearBtn);
-
-    top.appendChild(acts);
-    bar.appendChild(top);
-
-    const chipsWrap = document.createElement("div");
-    chipsWrap.className = "chat-chips-wrap";
-    items.forEach((item) => {
-      const chip = document.createElement("div");
-      chip.className = "chat-chip";
-      const scopeName = item.convTitle || item.projectName || "";
-      chip.title = `${item.name}${scopeName ? " · 来源: " + scopeName : ""}\n点击打开`;
-      const projHtml = scopeName ? `<span class="chat-chip-proj">${esc(scopeName)}</span>` : "";
-      chip.innerHTML = `
-        <span class="chat-chip-name">${esc(item.name)}</span>
-        ${projHtml}
-        <button class="chat-chip-x" title="移出本对话引用">×</button>
-      `;
-      chip.addEventListener("click", (e) => {
-        if (e.target.closest(".chat-chip-x")) {
-          e.stopPropagation();
-          detachFromChat(item.path, false);
-          return;
-        }
-        openFileByDefaultPreference(item);
-      });
-      chipsWrap.appendChild(chip);
-    });
-    bar.appendChild(chipsWrap);
-  }
-
   function renderList() {
     const container = el("fileListContainer");
     const filtered = getFilteredFiles();
@@ -2157,21 +1959,8 @@
     filtered.forEach((f) => container.appendChild(createItemElement(f)));
   }
 
-  function applyLanguageLabels() {
-    const lang = (state.config && state.config.language) || "zh";
-    const dict = I18N[lang] || I18N.zh;
-    document.querySelectorAll("[data-i18n]").forEach((node) => {
-      const key = node.getAttribute("data-i18n");
-      if (dict[key]) node.textContent = dict[key];
-    });
-    if (el("filterBtnLabel")) el("filterBtnLabel").textContent = dict.filterBtn;
-    if (el("searchInput")) el("searchInput").placeholder = dict.searchPlaceholder;
-  }
-
   function renderAll() {
-    applyLanguageLabels();
     renderProjectBar();
-    renderChatAttachedBar();
     updateSortButtonUI();
     updateGroupButtonUI();
     updateCompositeBarUI();
@@ -2220,7 +2009,7 @@
 
     body.innerHTML = `
       <div class="settings-sec">
-        <div class="settings-sec-title">外观与语言</div>
+        <div class="settings-sec-title">界面外观</div>
         <div class="settings-row">
           <label for="setTheme">界面主题（实时生效）</label>
           <select id="setTheme" class="settings-select">
@@ -2228,13 +2017,6 @@
             <option value="light" ${cfg.appearanceTheme === "light" ? "selected" : ""}>浅色 (Light)</option>
             <option value="dark" ${cfg.appearanceTheme === "dark" ? "selected" : ""}>深色 (Dark)</option>
             <option value="system" ${cfg.appearanceTheme === "system" ? "selected" : ""}>跟随系统 (System)</option>
-          </select>
-        </div>
-        <div class="settings-row">
-          <label for="setLanguage">界面语言</label>
-          <select id="setLanguage" class="settings-select">
-            <option value="zh" ${cfg.language !== "en" ? "selected" : ""}>简体中文</option>
-            <option value="en" ${cfg.language === "en" ? "selected" : ""}>English</option>
           </select>
         </div>
       </div>
@@ -2424,7 +2206,6 @@
   async function saveSettingsFromModal() {
     const patch = {
       appearanceTheme: el("setTheme").value,
-      language: el("setLanguage").value,
       defaultClickAction: el("setClickAction").value,
       defaultScope: el("setDefaultScope").value,
       collapseGroups: Boolean(el("setCollapseGroups").checked),
@@ -2593,14 +2374,18 @@
       forgetPathsAction(sel);
     });
   }
-  el("batchChatBtn").addEventListener("click", () => {
-    const files = Array.from(state.selectedPaths).map(findFileByPath).filter(Boolean);
-    attachToChat(files);
-    state.selectMode = false;
-    state.selectedPaths.clear();
-    updateCompositeBarUI();
-    renderList();
-  });
+  if (el("batchCopyRefBtn")) {
+    el("batchCopyRefBtn").addEventListener("click", async () => {
+      const files = Array.from(state.selectedPaths).map(findFileByPath).filter(Boolean);
+      const ok = await copyFileReferences(files);
+      if (ok) {
+        state.selectMode = false;
+        state.selectedPaths.clear();
+        updateCompositeBarUI();
+        renderList();
+      }
+    });
+  }
 
   el("sortTimeBtn").addEventListener("click", () => {
     const order = ["time_desc", "time_asc", "name", "type"];
@@ -2639,7 +2424,8 @@
     }
     const cfg = state.config || {};
     if (cfg.autoRefresh === false) return;
-    const sec = Math.max(5, Math.min(300, parseInt(cfg.refreshSeconds || "60", 10) || 60));
+    const rawSec = parseInt(cfg.refreshSeconds || "60", 10) || 60;
+    const sec = Math.max(5, Math.min(300, rawSec === 60 ? 6 : rawSec));
     autoRefreshTimer = setInterval(() => {
       if (!state.contextMenuFile && !state.selectMode && !state.scopeMenuOpen && !state.filterPopoverOpen && isRealSidecarVisible()) {
         fetchState(false);
@@ -2710,8 +2496,6 @@
       state.pinnedFiles = data.pinnedFiles || [];
       state.archivedFiles = data.archivedFiles || [];
       state.recentFiles = data.recentFiles || [];
-      state.chatAttachedFiles = data.chatAttachedFiles || [];
-      syncAttachedPathSet();
 
       const validScope = (id) =>
         id === "all" ||
@@ -2747,26 +2531,18 @@
       try {
         pollAbortCtrl = new AbortController();
         const visFlag = updateVisibilityTimestamp() ? "1" : "0";
-        const res = await sidecarFetch("/api/poll-open?wait=15&visible=" + visFlag, {
-          signal: pollAbortCtrl.signal,
-        });
+        const myConvId = getConversationId();
+        const res = await sidecarFetch(
+          "/api/poll-open?wait=15&visible=" + visFlag + "&conversationId=" + encodeURIComponent(myConvId),
+          { signal: pollAbortCtrl.signal }
+        );
         const data = await res.json();
         if (data && data.ok && Array.isArray(data.queue) && data.queue.length > 0 && isRealSidecarVisible()) {
-          const hasHostAction = data.queue.some((a) => a && (a.type === "open" || a.type === "attach"));
-          if (hasHostAction) await waitForHostUucReady();
           const ackIds = [];
           for (const action of data.queue) {
+            if (action.conversationId && myConvId && action.conversationId !== myConvId) continue;
             if (action.type === "open" && action.file) {
               await openInSidePane(action.file);
-            } else if (action.type === "attach") {
-              await attachToChat(action.files || [], true);
-            } else if (action.type === "sync_attached") {
-              if (!action.ts || action.ts * 1000 >= lastLocalAttachedMutAt - 150) {
-                state.chatAttachedFiles = Array.isArray(action.chatAttachedFiles) ? action.chatAttachedFiles : [];
-                syncAttachedPathSet();
-                renderChatAttachedBar();
-                renderList();
-              }
             }
             if (action.id) ackIds.push(action.id);
           }
@@ -2795,6 +2571,18 @@
 
   document.addEventListener("visibilitychange", handleVisibilityOrResize);
   window.addEventListener("resize", handleVisibilityOrResize);
+  document.addEventListener("pointerenter", () => {
+    if (
+      isRealSidecarVisible() &&
+      Date.now() - LAST_AUTO_SYNC_AT > 2500 &&
+      !state.contextMenuFile &&
+      !state.selectMode &&
+      !state.scopeMenuOpen &&
+      !state.filterPopoverOpen
+    ) {
+      fetchState(false);
+    }
+  });
   window.addEventListener("focus", () => {
     if (
       isRealSidecarVisible() &&
@@ -2819,6 +2607,9 @@
     });
   }
 
+  if (el("fileListContainer")) {
+    startComfortLoader(el("fileListContainer"), "init", 2200);
+  }
   fetchState(false).then(() => scheduleAutoRefresh());
   startPollLoop();
   scheduleAutoRefresh();

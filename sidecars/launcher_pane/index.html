@@ -11,8 +11,8 @@
     <!-- 主列表视图 -->
     <div id="listViewWrap" style="display:flex;flex-direction:column;height:100vh;">
       <!-- 顶部最高优先级：项目 / 左侧对话 / 本地文件夹隔离范围选择 -->
-      <div id="scopeBar" class="scope-bar" title="选择范围：优先隔离 Antigravity 项目与左侧边栏对话；勾选文件点「加入对话框」可跨对话引用">
-        <span class="scope-bar-label" data-i18n="scopeLabel">隔离范围</span>
+      <div id="scopeBar" class="scope-bar" title="选择范围：优先隔离 Antigravity 项目与左侧边栏对话；支持一键复制文件 @ 引用">
+        <span class="scope-bar-label">隔离范围</span>
         <div id="scopeWrap" class="scope-select-wrap">
           <button id="scopeTrigger" type="button" class="scope-trigger">
             <span class="scope-trigger-left">
@@ -33,24 +33,24 @@
       <header class="codex-header">
         <div class="seg-tabs">
           <button id="tabSession" class="seg-btn active" data-tab="session" title="AI 在会话中产生、修改与读取的文档">
-            <span data-i18n="tabSession">本次产出</span>
+            <span>本次产出</span>
             <span id="countSession" class="seg-count">0</span>
           </button>
           <button id="tabSent" class="seg-btn" data-tab="sent" title="单独隔离：您发送、上传或 @引用 的文件与文件夹">
-            <span data-i18n="tabSent">我发送的</span>
+            <span>我发送的</span>
             <span id="countSent" class="seg-count">0</span>
           </button>
           <button id="tabPinned" class="seg-btn" data-tab="pinned" title="收藏保留区：防止上下文压缩吞掉重要文件">
-            <span data-i18n="tabPinned">★ 收藏保留</span>
+            <span>★ 收藏保留</span>
             <span id="countPinned" class="seg-count">0</span>
           </button>
           <button id="tabRecent" class="seg-btn" data-tab="recent" title="工作区及监控目录中的最近项目文件">
-            <span data-i18n="tabRecent">最近项目</span>
+            <span>最近项目</span>
             <span id="countRecent" class="seg-count">0</span>
           </button>
         </div>
         <div class="header-right">
-          <button id="selectModeBtn" class="icon-btn" title="进入多选模式：批量收藏(防压缩)、归档、移除记录或加入对话框">
+          <button id="selectModeBtn" class="icon-btn" title="进入多选模式：批量收藏(防压缩)、归档、移除记录或复制引用">
             <span>选择</span>
           </button>
           <button id="sortTimeBtn" class="icon-btn active" title="点击切换排序方式：时间↓ / 时间↑ / 名称 / 类型">
@@ -100,12 +100,17 @@
       <!-- 激活筛选标签条（支持单个点 × 移除或一键清除） -->
       <div id="activeFiltersBar" class="active-filters-bar hidden"></div>
 
-      <!-- 跨项目 / 跨对话持久化「加入对话框」引用托盘 -->
-      <div id="chatAttachedBar" class="chat-attached-bar hidden"></div>
-
       <!-- 主文件列表容器 -->
       <main id="fileListContainer" class="codex-list">
-        <div class="empty-box">正在加载文件列表...</div>
+        <div class="empty-box fl-loading-box" role="status">
+          <div class="fl-loading-head">
+            <span class="fl-spinner" aria-hidden="true"></span>
+            <span class="fl-loading-title">正在为您整理对话产出与项目文件，请稍候…</span>
+          </div>
+          <div class="fl-loading-track" aria-hidden="true"><div class="fl-loading-fill" style="width: 24%"></div></div>
+          <p class="fl-loading-eta">初次扫描预计约 1–3 秒，马上就绪</p>
+          <p class="fl-loading-hint">就绪后会自动展示，请放心稍等片刻。</p>
+        </div>
       </main>
 
       <!-- 底部多选批量操作栏 -->
@@ -118,7 +123,7 @@
           <button id="batchPinBtn" class="comp-btn" title="收藏所选文件并写入防压缩保护清单">★ 收藏</button>
           <button id="batchArchiveBtn" class="comp-btn" title="归档复制到按日期分类的目录">📦 归档</button>
           <button id="batchForgetBtn" class="comp-btn" title="仅从插件索引中移除记录（不删除磁盘文件）">移除记录</button>
-          <button id="batchChatBtn" class="comp-btn primary" title="把所选文件加入对话框，随下一条消息一起发送">加入对话框</button>
+          <button id="batchCopyRefBtn" class="comp-btn primary" title="一键复制所选文件引用，粘贴到对话框即可发送">复制引用</button>
         </div>
       </div>
     </div>
